@@ -127,7 +127,7 @@ impl<'a> Writer<'a> {
             value.payload.clone(),
             Channel {
                 priority: self.priority.into(),
-                reliability: Reliability::Reliable, // @TODO: need to check subscriptions to determine the right reliability value
+                reliability: Reliability::BestEffort, // @TODO: need to check subscriptions to determine the right reliability value
             },
             self.congestion_control,
             data_info.clone(),
