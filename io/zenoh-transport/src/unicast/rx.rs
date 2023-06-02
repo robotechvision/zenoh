@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -12,19 +12,21 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use super::common::conduit::TransportChannelRx;
-use super::protocol::core::{PeerId, Priority, Reliability, ZInt};
-#[cfg(feature = "stats")]
-use super::protocol::proto::ZenohBody;
-use super::protocol::proto::{
-    Close, Frame, FramePayload, KeepAlive, TransportBody, TransportMessage, ZenohMessage,
-};
 use super::transport::TransportUnicastInner;
 use async_std::task;
 use std::sync::MutexGuard;
 #[cfg(feature = "stats")]
 use zenoh_buffers::SplitBuffer;
-use zenoh_core::{bail, zerror, zlock, zread, Result as ZResult};
+use zenoh_core::{zlock, zread};
 use zenoh_link::LinkUnicast;
+#[cfg(feature = "stats")]
+use zenoh_protocol::zenoh::ZenohBody;
+use zenoh_protocol::{
+    core::{Priority, Reliability, ZInt, ZenohId},
+    transport::{tmsg, Close, Frame, FramePayload, KeepAlive, TransportBody, TransportMessage},
+    zenoh::ZenohMessage,
+};
+use zenoh_result::{bail, zerror, ZResult};
 
 /*************************************/
 /*            TRANSPORT RX           */
@@ -64,12 +66,14 @@ impl TransportUnicastInner {
         let callback = zread!(self.callback).clone();
         if let Some(callback) = callback.as_ref() {
             #[cfg(feature = "shared-memory")]
-            let _ = msg.map_to_shmbuf(self.config.manager.shmr.clone())?;
+            {
+                crate::shm::map_zmsg_to_shmbuf(&mut msg, &self.config.manager.shmr)?;
+            }
             callback.handle_message(msg)
         } else {
             log::debug!(
                 "Transport: {}. No callback available, dropping message: {}",
-                self.config.pid,
+                self.config.zid,
                 msg
             );
             Ok(())
@@ -79,20 +83,19 @@ impl TransportUnicastInner {
     fn handle_close(
         &self,
         link: &LinkUnicast,
-        pid: Option<PeerId>,
+        zid: Option<ZenohId>,
         reason: u8,
         link_only: bool,
     ) -> ZResult<()> {
         // Check if the PID is correct when provided
-        if let Some(pid) = pid {
-            if pid != self.config.pid {
-                log::debug!(
-                    "Received an invalid Close on link {} from peer {} with reason: {}. Ignoring.",
-                    link,
-                    pid,
-                    reason
+        if let Some(zid) = zid {
+            if zid != self.config.zid {
+                bail!(
+                    "Transport: {}. Invalid close zid: {} reason: {}.",
+                    self.config.zid,
+                    zid,
+                    tmsg::close_reason_to_str(reason)
                 );
-                return Ok(());
             }
         }
 
@@ -126,7 +129,7 @@ impl TransportUnicastInner {
         if !precedes {
             log::debug!(
                 "Transport: {}. Frame with invalid SN dropped: {}. Expected: {}.",
-                self.config.pid,
+                self.config.zid,
                 sn,
                 guard.sn.get()
             );
@@ -150,7 +153,7 @@ impl TransportUnicastInner {
                 if is_final {
                     // When shared-memory feature is disabled, msg does not need to be mutable
                     let msg = guard.defrag.defragment().ok_or_else(|| {
-                        zerror!("Transport: {}. Defragmentation error.", self.config.pid)
+                        zerror!("Transport: {}. Defragmentation error.", self.config.zid)
                     })?;
                     self.trigger_callback(msg)
                 } else {
@@ -182,7 +185,7 @@ impl TransportUnicastInner {
                 } else {
                     bail!(
                         "Transport: {}. Unknown conduit: {:?}.",
-                        self.config.pid,
+                        self.config.zid,
                         channel.priority
                     );
                 };
@@ -195,15 +198,15 @@ impl TransportUnicastInner {
                 }
             }
             TransportBody::Close(Close {
-                pid,
+                zid,
                 reason,
                 link_only,
-            }) => self.handle_close(link, pid, reason, link_only),
+            }) => self.handle_close(link, zid, reason, link_only),
             TransportBody::KeepAlive(KeepAlive { .. }) => Ok(()),
             _ => {
                 log::debug!(
                     "Transport: {}. Message handling not implemented: {:?}",
-                    self.config.pid,
+                    self.config.zid,
                     msg
                 );
                 Ok(())

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -19,15 +19,23 @@ use crate::{
     TransportManager, TransportMulticastEventHandler, TransportPeer, TransportPeerEventHandler,
 };
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
-use zenoh_collections::{Timed, TimedEvent, TimedHandle, Timer};
-use zenoh_core::{bail, zread, zwrite, Result as ZResult};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
+    time::Duration,
+};
+use zenoh_core::{zread, zwrite};
 use zenoh_link::{Link, LinkMulticast, Locator};
-use zenoh_protocol::core::{ConduitSnList, PeerId, Priority, WhatAmI, ZInt};
-use zenoh_protocol::proto::{tmsg, Join, TransportMessage, ZenohMessage};
+use zenoh_protocol::{
+    core::{ConduitSnList, Priority, WhatAmI, ZInt, ZenohId},
+    transport::{tmsg, Join, TransportMessage},
+    zenoh::ZenohMessage,
+};
+use zenoh_result::{bail, ZResult};
+use zenoh_util::{Timed, TimedEvent, TimedHandle, Timer};
 
 /*************************************/
 /*             TRANSPORT             */
@@ -36,7 +44,7 @@ use zenoh_protocol::proto::{tmsg, Join, TransportMessage, ZenohMessage};
 pub(super) struct TransportMulticastPeer {
     pub(super) version: u8,
     pub(super) locator: Locator,
-    pub(super) pid: PeerId,
+    pub(super) zid: ZenohId,
     pub(super) whatami: WhatAmI,
     pub(super) sn_resolution: ZInt,
     pub(super) lease: Duration,
@@ -200,7 +208,7 @@ impl TransportMulticastInner {
     pub(crate) async fn close(&self, reason: u8) -> ZResult<()> {
         log::trace!(
             "Closing multicast transport of peer {}: {}",
-            self.manager.config.pid,
+            self.manager.config.zid,
             self.locator
         );
 
@@ -213,7 +221,7 @@ impl TransportMulticastInner {
             .clone();
 
         // Close message to be sent on all the links
-        let peer_id = Some(self.manager.pid());
+        let peer_id = Some(self.manager.zid());
         let reason_id = reason;
         // link_only should always be false for user-triggered close. However, in case of
         // multiple links, it is safer to close all the links first. When no links are left,
@@ -232,20 +240,18 @@ impl TransportMulticastInner {
     /*        SCHEDULE AND SEND TX       */
     /*************************************/
     /// Schedule a Zenoh message on the transmission queue    
-    #[cfg(feature = "shared-memory")]
-    pub(crate) fn schedule(&self, mut message: ZenohMessage) {
+    #[allow(unused_mut)] // Required with "shared-memory" feature
+    pub(crate) fn schedule(&self, mut msg: ZenohMessage) {
         // Multicast transports do not support SHM for the time being
-        let res = message.map_to_shmbuf(self.manager.shmr.clone());
-        if let Err(e) = res {
-            log::trace!("Failed SHM conversion: {}", e);
-            return;
+        #[cfg(feature = "shared-memory")]
+        {
+            let res = crate::shm::map_zmsg_to_shmbuf(&mut msg, &self.manager.shmr);
+            if let Err(e) = res {
+                log::trace!("Failed SHM conversion: {}", e);
+                return;
+            }
         }
-        self.schedule_first_fit(message);
-    }
-
-    #[cfg(not(feature = "shared-memory"))]
-    pub(crate) fn schedule(&self, message: ZenohMessage) {
-        self.schedule_first_fit(message);
+        self.schedule_first_fit(msg);
     }
 
     /*************************************/
@@ -258,7 +264,7 @@ impl TransportMulticastInner {
                 assert!(!self.conduit_tx.is_empty());
                 let config = TransportLinkMulticastConfig {
                     version: self.manager.config.version,
-                    pid: self.manager.config.pid,
+                    zid: self.manager.config.zid,
                     whatami: self.manager.config.whatami,
                     lease: self.manager.config.multicast.lease,
                     keep_alive: self.manager.config.multicast.keep_alive,
@@ -272,7 +278,7 @@ impl TransportMulticastInner {
             None => {
                 bail!(
                     "Can not start multicast Link TX of peer {}: {}",
-                    self.manager.config.pid,
+                    self.manager.config.zid,
                     self.locator
                 )
             }
@@ -289,7 +295,7 @@ impl TransportMulticastInner {
             None => {
                 bail!(
                     "Can not stop multicast Link TX of peer {}: {}",
-                    self.manager.config.pid,
+                    self.manager.config.zid,
                     self.locator
                 )
             }
@@ -306,7 +312,7 @@ impl TransportMulticastInner {
             None => {
                 bail!(
                     "Can not start multicast Link RX of peer {}: {}",
-                    self.manager.config.pid,
+                    self.manager.config.zid,
                     self.locator
                 )
             }
@@ -323,7 +329,7 @@ impl TransportMulticastInner {
             None => {
                 bail!(
                     "Can not stop multicast Link RX of peer {}: {}",
-                    self.manager.config.pid,
+                    self.manager.config.zid,
                     self.locator
                 )
             }
@@ -338,7 +344,7 @@ impl TransportMulticastInner {
         link.dst = locator.clone();
 
         let peer = TransportPeer {
-            pid: join.pid,
+            zid: join.zid,
             whatami: join.whatami,
             is_qos: join.is_qos(),
             is_shm: self.is_shm(),
@@ -388,7 +394,7 @@ impl TransportMulticastInner {
         let peer = TransportMulticastPeer {
             version: join.version,
             locator: locator.clone(),
-            pid: peer.pid,
+            zid: peer.zid,
             whatami: peer.whatami,
             sn_resolution: join.sn_resolution,
             lease: join.lease,
@@ -405,9 +411,9 @@ impl TransportMulticastInner {
         self.timer.add(event);
 
         log::debug!(
-                "New transport joined on {}: pid {}, whatami {}, sn resolution {}, locator {}, qos {}, initial sn: {}",
+                "New transport joined on {}: zid {}, whatami {}, sn resolution {}, locator {}, qos {}, initial sn: {}",
                 self.locator,
-                join.pid,
+                join.zid,
                 join.whatami,
                 join.sn_resolution,
                 locator,
@@ -423,7 +429,7 @@ impl TransportMulticastInner {
         if let Some(peer) = guard.remove(locator) {
             log::debug!(
                 "Peer {}/{}/{} has left multicast {} with reason: {}",
-                peer.pid,
+                peer.zid,
                 peer.whatami,
                 locator,
                 self.locator,
@@ -446,7 +452,7 @@ impl TransportMulticastInner {
                 link.dst = p.locator.clone();
 
                 TransportPeer {
-                    pid: p.pid,
+                    zid: p.zid,
                     whatami: p.whatami,
                     is_qos: p.is_qos(),
                     is_shm: self.is_shm(),

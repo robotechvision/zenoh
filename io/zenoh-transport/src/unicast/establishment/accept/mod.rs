@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -21,11 +21,11 @@ use crate::unicast::establishment::{
     close_link, transport_finalize, transport_init, InputFinalize,
 };
 use crate::TransportManager;
-use zenoh_core::Result as ZResult;
 use zenoh_link::{LinkUnicast, LinkUnicastDirection};
-use zenoh_protocol::proto::tmsg;
+use zenoh_protocol::transport::tmsg;
+use zenoh_result::ZResult;
 
-pub(super) type AError = (zenoh_core::Error, Option<u8>);
+pub(super) type AError = (zenoh_result::Error, Option<u8>);
 pub(super) type AResult<T> = Result<T, AError>;
 
 pub(crate) async fn accept_link(
@@ -39,6 +39,7 @@ pub(crate) async fn accept_link(
             match $s {
                 Ok(output) => output,
                 Err((e, reason)) => {
+                    log::error!("{}", e);
                     close_link(link, manager, auth_link, reason).await;
                     return Err(e);
                 }
@@ -51,27 +52,17 @@ pub(crate) async fn accept_link(
     let output = step!(open_syn::recv(link, manager, auth_link, output).await);
 
     // Initialize the transport
-    macro_rules! step {
-        ($s: expr) => {
-            match $s {
-                Ok(output) => output,
-                Err(e) => {
-                    close_link(link, manager, auth_link, Some(tmsg::close_reason::INVALID)).await;
-                    return Err(e);
-                }
-            }
-        };
-    }
-
-    let pid = output.cookie.pid;
+    let zid = output.cookie.zid;
     let input = super::InputInit {
-        pid: output.cookie.pid,
+        zid: output.cookie.zid,
         whatami: output.cookie.whatami,
         sn_resolution: output.cookie.sn_resolution,
         is_shm: output.is_shm,
         is_qos: output.cookie.is_qos,
     };
-    let transport = step!(transport_init(manager, input).await);
+    let transport = step!(transport_init(manager, input)
+        .await
+        .map_err(|e| (e, Some(tmsg::close_reason::INVALID))));
 
     // OPEN handshake
     macro_rules! step {
@@ -79,9 +70,13 @@ pub(crate) async fn accept_link(
             match $s {
                 Ok(output) => output,
                 Err((e, reason)) => {
+                    match reason {
+                        Some(tmsg::close_reason::MAX_LINKS) => log::debug!("{}", e),
+                        _ => log::error!("{}", e),
+                    }
                     if let Ok(ll) = transport.get_links() {
                         if ll.is_empty() {
-                            let _ = manager.del_transport_unicast(&pid).await;
+                            let _ = manager.del_transport_unicast(&zid).await;
                         }
                     }
                     close_link(link, manager, auth_link, reason).await;
@@ -105,7 +100,7 @@ pub(crate) async fn accept_link(
     .sync(output.initial_sn)
     .await;
 
-    log::debug!("New transport link established from {}: {}", pid, link);
+    log::debug!("New transport link established from {}: {}", zid, link);
 
     let initial_sn = step!(transport
         .get_inner()

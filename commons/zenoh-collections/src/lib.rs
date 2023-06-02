@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,21 +11,24 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-#[macro_use]
-pub mod fifo_queue;
-pub use fifo_queue::*;
 
-pub mod lifo_queue;
-pub use lifo_queue::*;
+//! ⚠️ WARNING ⚠️
+//!
+//! This crate is intended for Zenoh's internal use.
+//!
+//! [Click here for Zenoh's documentation](../zenoh/index.html)
+#![cfg_attr(not(feature = "std"), no_std)]
+extern crate alloc;
 
-pub mod object_pool;
-pub use object_pool::*;
+pub mod single_or_vec;
+pub use single_or_vec::*;
 
-pub(crate) mod ring_buffer;
-pub(crate) use ring_buffer::*;
+#[cfg(feature = "std")]
+pub mod ring_buffer;
+#[cfg(feature = "std")]
+pub use ring_buffer::*;
 
-pub(crate) mod stack_buffer;
-pub(crate) use stack_buffer::*;
-
-pub mod timer;
-pub use timer::*;
+#[cfg(feature = "std")]
+pub mod stack_buffer;
+#[cfg(feature = "std")]
+pub use stack_buffer::*;

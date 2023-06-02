@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2022 ZettaScale Technology
+# Copyright (c) 2023 ZettaScale Technology
 #
 # This program and the accompanying materials are made available under the
 # terms of the Eclipse Public License 2.0 which is available at
@@ -12,46 +12,40 @@
 #   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 #
 [package]
+rust-version = { workspace = true }
 name = "zenoh-examples"
-version = "0.6.0-dev.0"
-repository = "https://github.com/eclipse-zenoh/zenoh"
-homepage = "http://zenoh.io"
-authors = [
-	"kydos <angelo@icorsaro.net>",
-	"Julien Enoch <julien@enoch.fr>",
-	"Olivier Hécart <olivier.hecart@zettascale.tech>",
-	"Luca Cominardi <luca.cominardi@zettascale.tech>",
-	"Pierre Avital <pierre.avital@zettascale.tech>",
-]
-edition = "2018"
-license = " EPL-2.0 OR Apache-2.0"
-categories = ["network-programming"]
+version = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+categories = { workspace = true }
 description = "Internal crate for zenoh."
 readme = "README.md"
-
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
 shared-memory = ["zenoh/shared-memory"]
+unstable = ["zenoh/unstable"]
 
 [dependencies]
-zenoh = { path = "../zenoh/" }
-
-async-std = { version = "=1.11.0", default-features = false, features = [
-	"attributes",
-] }
-clap = "2.33.3"
-env_logger = "0.9.0"
-futures = "0.3.12"
-git-version = "0.3.4"
-json5 = "0.4.1"
-log = "0.4"
+async-std = { workspace = true, features = ["attributes"] }
+clap = { workspace = true }
+env_logger = { workspace = true }
+flume = { workspace = true }
+futures = { workspace = true }
+git-version = { workspace = true }
+json5 = { workspace = true }
+log = { workspace = true }
+zenoh = { workspace = true }
+zenoh-ext = { workspace = true }
 
 [dev-dependencies]
-rand = "0.8.3"
+rand = { workspace = true, features = ["default"] }
 
 [build-dependencies]
-rustc_version = "0.4.0"
+rustc_version = { workspace = true }
 
 [package.metadata.deb]
 name = "zenohd"
@@ -62,12 +56,11 @@ license-file = ["../LICENSE", "0"]
 depends = "$auto"
 maintainer-scripts = "zenoh/.deb"
 assets = [
-	# binary
-	["target/release/zenohd", "/usr/bin/", "755"],
-	# service
-	[".service/zenohd.service", "/lib/systemd/system/zenohd.service", "644"],
+  # binary
+  ["target/release/zenohd", "/usr/bin/", "755"],
+  # service
+  [".service/zenohd.service", "/lib/systemd/system/zenohd.service", "644"],
 ]
-
 
 [[example]]
 name = "z_scout"
@@ -90,6 +83,10 @@ name = "z_delete"
 path = "examples/z_delete.rs"
 
 [[example]]
+name = "z_formats"
+path = "examples/z_formats.rs"
+
+[[example]]
 name = "z_pub"
 path = "examples/z_pub.rs"
 
@@ -107,8 +104,8 @@ name = "z_pull"
 path = "examples/z_pull.rs"
 
 [[example]]
-name = "z_eval"
-path = "examples/z_eval.rs"
+name = "z_queryable"
+path = "examples/z_queryable.rs"
 
 [[example]]
 name = "z_storage"
@@ -121,6 +118,21 @@ path = "examples/z_get.rs"
 [[example]]
 name = "z_forward"
 path = "examples/z_forward.rs"
+
+[[example]]
+name = "z_liveliness"
+path = "examples/z_liveliness.rs"
+required-features = ["unstable"]
+
+[[example]]
+name = "z_sub_liveliness"
+path = "examples/z_sub_liveliness.rs"
+required-features = ["unstable"]
+
+[[example]]
+name = "z_get_liveliness"
+path = "examples/z_get_liveliness.rs"
+required-features = ["unstable"]
 
 [[example]]
 name = "z_pub_thr"

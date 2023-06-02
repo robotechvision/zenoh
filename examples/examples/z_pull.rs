@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,14 +11,13 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+use async_std::prelude::FutureExt;
 use async_std::task::sleep;
 use clap::{App, Arg};
 use futures::prelude::*;
-use futures::select;
 use std::time::Duration;
 use zenoh::config::Config;
-use zenoh::prelude::*;
-use zenoh::subscriber::SubMode;
+use zenoh::prelude::r#async::*;
 
 #[async_std::main]
 async fn main() {
@@ -28,44 +27,54 @@ async fn main() {
     let (config, key_expr) = parse_args();
 
     println!("Opening session...");
-    let session = zenoh::open(config).await.unwrap();
+    let session = zenoh::open(config).res().await.unwrap();
 
-    println!("Creating Subscriber on '{}'...", key_expr);
+    println!("Declaring Subscriber on '{key_expr}'...");
 
-    let mut subscriber = session
-        .subscribe(&key_expr)
-        .mode(SubMode::Pull)
+    let subscriber = session
+        .declare_subscriber(&key_expr)
+        .pull_mode()
+        .res()
         .await
         .unwrap();
 
     println!("Press <enter> to pull data...");
 
-    let mut stdin = async_std::io::stdin();
-    let mut input = [0_u8];
-    loop {
-        select!(
-            sample = subscriber.next() => {
-                let sample = sample.unwrap();
-                println!(">> [Subscriber] Received {} ('{}': '{}')",
-                    sample.kind, sample.key_expr.as_str(), String::from_utf8_lossy(&sample.value.payload.contiguous()));
-            },
+    // Define the future to handle incoming samples of the subscription.
+    let subs = async {
+        while let Ok(sample) = subscriber.recv_async().await {
+            println!(
+                ">> [Subscriber] Received {} ('{}': '{}')",
+                sample.kind,
+                sample.key_expr.as_str(),
+                sample.value,
+            );
+        }
+    };
 
-            _ = stdin.read_exact(&mut input).fuse() => {
-                match input[0] {
-                    b'q' => break,
-                    0 => sleep(Duration::from_secs(1)).await,
-                    _ => subscriber.pull().await.unwrap(),
-                }
+    // Define the future to handle keyboard's input.
+    let keyb = async {
+        let mut stdin = async_std::io::stdin();
+        let mut input = [0_u8];
+        loop {
+            stdin.read_exact(&mut input).await.unwrap();
+            match input[0] {
+                b'q' => break,
+                0 => sleep(Duration::from_secs(1)).await,
+                _ => subscriber.pull().res().await.unwrap(),
             }
-        );
-    }
+        }
+    };
+
+    // Execute both futures concurrently until one of them returns.
+    subs.race(keyb).await;
 }
 
 fn parse_args() -> (Config, String) {
     let args = App::new("zenoh pull example")
         .arg(
             Arg::from_usage("-m, --mode=[MODE]  'The zenoh session mode (peer by default).")
-                .possible_values(&["peer", "client"]),
+                .possible_values(["peer", "client"]),
         )
         .arg(Arg::from_usage(
             "-e, --connect=[ENDPOINT]...   'Endpoints to connect to.'",
@@ -75,7 +84,7 @@ fn parse_args() -> (Config, String) {
         ))
         .arg(
             Arg::from_usage("-k, --key=[KEYEXPR] 'The key expression matching resources to pull'")
-                .default_value("/demo/example/**"),
+                .default_value("demo/example/**"),
         )
         .arg(Arg::from_usage(
             "-c, --config=[FILE]      'A configuration file.'",

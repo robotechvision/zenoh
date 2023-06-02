@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -14,7 +14,7 @@
 use clap::{App, Arg};
 use std::convert::TryInto;
 use zenoh::config::Config;
-use zenoh::prelude::*;
+use zenoh::prelude::sync::*;
 use zenoh::publication::CongestionControl;
 
 fn main() {
@@ -27,28 +27,26 @@ fn main() {
         .collect::<Vec<u8>>()
         .into();
 
-    let session = zenoh::open(config).wait().unwrap();
+    let session = zenoh::open(config).res().unwrap();
 
-    let key_expr = session.declare_expr("/test/thr").wait().unwrap();
+    let publisher = session
+        .declare_publisher("test/thr")
+        .congestion_control(CongestionControl::Block)
+        .priority(prio)
+        .res()
+        .unwrap();
 
     let mut count: usize = 0;
     let mut start = std::time::Instant::now();
     loop {
-        session
-            .put(&key_expr, data.clone())
-            // Make sure to not drop messages because of congestion control
-            .congestion_control(CongestionControl::Block)
-            // Set the right priority
-            .priority(prio)
-            .wait()
-            .unwrap();
+        publisher.put(data.clone()).res().unwrap();
 
         if print {
             if count < number {
                 count += 1;
             } else {
                 let thpt = count as f64 / start.elapsed().as_secs_f64();
-                println!("{} msg/s", thpt);
+                println!("{thpt} msg/s");
                 count = 0;
                 start = std::time::Instant::now();
             }
@@ -60,7 +58,7 @@ fn parse_args() -> (Config, usize, Priority, bool, usize) {
     let args = App::new("zenoh throughput pub example")
         .arg(
             Arg::from_usage("-m, --mode=[MODE] 'The zenoh session mode (peer by default).")
-                .possible_values(&["peer", "client"]),
+                .possible_values(["peer", "client"]),
         )
         .arg(Arg::from_usage(
             "-p, --priority=[PRIO]...  'Priority for sending data.'",

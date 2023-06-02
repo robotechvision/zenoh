@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -13,6 +13,8 @@
 //
 use clap::{App, Arg};
 use zenoh::config::Config;
+use zenoh::prelude::r#async::*;
+use zenoh_ext::SubscriberForward;
 
 #[async_std::main]
 async fn main() {
@@ -22,13 +24,13 @@ async fn main() {
     let (config, key_expr, forward) = parse_args();
 
     println!("Opening session...");
-    let session = zenoh::open(config).await.unwrap();
+    let session = zenoh::open(config).res().await.unwrap();
 
-    println!("Creating Subscriber on '{}'...", key_expr);
-    let mut subscriber = session.subscribe(&key_expr).await.unwrap();
-    println!("Creating Publisher on '{}'...", forward);
-    let publisher = session.publish(&forward).await.unwrap();
-    println!("Forwarding data from '{}' to '{}'...", key_expr, forward);
+    println!("Declaring Subscriber on '{key_expr}'...");
+    let mut subscriber = session.declare_subscriber(&key_expr).res().await.unwrap();
+    println!("Declaring Publisher on '{forward}'...");
+    let publisher = session.declare_publisher(&forward).res().await.unwrap();
+    println!("Forwarding data from '{key_expr}' to '{forward}'...");
     subscriber.forward(publisher).await.unwrap();
 }
 
@@ -36,7 +38,7 @@ fn parse_args() -> (Config, String, String) {
     let args = App::new("zenoh sub example")
         .arg(
             Arg::from_usage("-m, --mode=[MODE]  'The zenoh session mode (peer by default).")
-                .possible_values(&["peer", "client"]),
+                .possible_values(["peer", "client"]),
         )
         .arg(Arg::from_usage(
             "-e, --connect=[ENDPOINT]...   'Endpoints to connect to.'",
@@ -46,11 +48,11 @@ fn parse_args() -> (Config, String, String) {
         ))
         .arg(
             Arg::from_usage("-k, --key=[KEYEXPR] 'The key expression to subscribe to.'")
-                .default_value("/demo/example/**"),
+                .default_value("demo/example/**"),
         )
         .arg(
             Arg::from_usage("-f, --forward=[KEYEXPR] 'The key expression to forward to.'")
-                .default_value("/demo/forward"),
+                .default_value("demo/forward"),
         )
         .arg(Arg::from_usage(
             "-c, --config=[FILE]      'A configuration file.'",
@@ -74,7 +76,7 @@ fn parse_args() -> (Config, String, String) {
             .endpoints
             .extend(values.map(|v| v.parse().unwrap()))
     }
-    if let Some(values) = args.values_of("listeners") {
+    if let Some(values) = args.values_of("listen") {
         config
             .listen
             .endpoints

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,23 +11,203 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use async_std::prelude::FutureExt;
-use async_std::task;
-use std::any::Any;
-use std::fmt::Write;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use async_std::{prelude::FutureExt, task};
+use std::fmt::Write as _;
+use std::{
+    any::Any,
+    convert::TryFrom,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+use zenoh_buffers::ZBuf;
 use zenoh_core::zasync_executor_init;
-use zenoh_core::Result as ZResult;
-use zenoh_link::{EndPoint, Link};
-use zenoh_protocol::io::ZBuf;
-use zenoh_protocol::proto::ZenohMessage;
-use zenoh_protocol_core::{Channel, CongestionControl, PeerId, Priority, Reliability, WhatAmI};
+use zenoh_link::Link;
+use zenoh_protocol::{
+    core::{Channel, CongestionControl, EndPoint, Priority, Reliability, WhatAmI, ZenohId},
+    zenoh::ZenohMessage,
+};
+use zenoh_result::ZResult;
 use zenoh_transport::{
     TransportEventHandler, TransportManager, TransportMulticast, TransportMulticastEventHandler,
     TransportPeer, TransportPeerEventHandler, TransportUnicast,
 };
+
+// These keys and certificates below are purposedly generated to run TLS and mTLS tests.
+//
+// With 2 way authentication (mTLS), using TLS 1.3, we need two pairs of keys and certificates: one
+// for the "server" and another one for the "client".
+//
+// The keys and certificates below were auto-generated using https://github.com/jsha/minica and
+// target the localhost domain, so it has no real mapping to any existing domain.
+//
+// The keys and certificates generated map as follows to the constants below:
+//
+//   certificates
+//   ├── client
+//   │   ├── localhost
+//   │   │   ├── cert.pem <------- CLIENT_CERT
+//   │   │   └── key.pem <-------- CLIENT_KEY
+//   │   ├── minica-key.pem
+//   │   └── minica.pem <--------- CLIENT_CA
+//   └── server
+//       ├── localhost
+//       │   ├── cert.pem <------- SERVER_CERT
+//       │   └── key.pem <-------- SERVER_KEY
+//       ├── minica-key.pem
+//       └── minica.pem <--------- SERVER_CA
+//
+// The way it works is that the client's certificate authority will validate in front of the server
+// the key and certificate brought in by the client. Similarly the server's certificate authority
+// will validate the key and certificate brought in by the server in front of the client.
+//
+#[cfg(all(feature = "transport_tls", target_family = "unix"))]
+const CLIENT_KEY: &str = "-----BEGIN RSA PRIVATE KEY-----
+MIIEpAIBAAKCAQEAsfqAuhElN4HnyeqLovSd4Qe+nNv5AwCjSO+HFiF30x3vQ1Hi
+qRA0UmyFlSqBnFH3TUHm4Jcad40QfrX8f11NKGZdpvKHsMYqYjZnYkRFGS2s4fQy
+aDbV5M06s3UDX8ETPgY41Y8fCKTSVdi9iHkwcVrXMxUu4IBBx0C1r2GSo3gkIBnU
+cELdFdaUOSbdCipJhbnkwixEr2h7PXxwba7SIZgZtRaQWak1VE9b716qe3iMuMha
+Efo/UoFmeZCPu5spfwaOZsnCsxRPk2IjbzlsHTJ09lM9wmbEFHBMVAXejLTk++Sr
+Xt8jASZhNen/2GzyLQNAquGn98lCMQ6SsE9vLQIDAQABAoIBAGQkKggHm6Q20L+4
+2+bNsoOqguLplpvM4RMpyx11qWE9h6GeUmWD+5yg+SysJQ9aw0ZSHWEjRD4ePji9
+lxvm2IIxzuIftp+NcM2gBN2ywhpfq9XbO/2NVR6PJ0dQQJzBG12bzKDFDdYkP0EU
+WdiPL+WoEkvo0F57bAd77n6G7SZSgxYekBF+5S6rjbu5I1cEKW+r2vLehD4uFCVX
+Q0Tu7TyIOE1KJ2anRb7ZXVUaguNj0/Er7EDT1+wN8KJKvQ1tYGIq/UUBtkP9nkOI
+9XJd25k6m5AQPDddzd4W6/5+M7kjyVPi3CsQcpBPss6ueyecZOMaKqdWAHeEyaak
+r67TofUCgYEA6GBa+YkRvp0Ept8cd5mh4gCRM8wUuhtzTQnhubCPivy/QqMWScdn
+qD0OiARLAsqeoIfkAVgyqebVnxwTrKTvWe0JwpGylEVWQtpGz3oHgjST47yZxIiY
+CSAaimi2CYnJZ+QB2oBkFVwNCuXdPEGX6LgnOGva19UKrm6ONsy6V9MCgYEAxBJu
+fu4dGXZreARKEHa/7SQjI9ayAFuACFlON/EgSlICzQyG/pumv1FsMEiFrv6w7PRj
+4AGqzyzGKXWVDRMrUNVeGPSKJSmlPGNqXfPaXRpVEeB7UQhAs5wyMrWDl8jEW7Ih
+XcWhMLn1f/NOAKyrSDSEaEM+Nuu+xTifoAghvP8CgYEAlta9Fw+nihDIjT10cBo0
+38w4dOP7bFcXQCGy+WMnujOYPzw34opiue1wOlB3FIfL8i5jjY/fyzPA5PhHuSCT
+Ec9xL3B9+AsOFHU108XFi/pvKTwqoE1+SyYgtEmGKKjdKOfzYA9JaCgJe1J8inmV
+jwXCx7gTJVjwBwxSmjXIm+sCgYBQF8NhQD1M0G3YCdCDZy7BXRippCL0OGxVfL2R
+5oKtOVEBl9NxH/3+evE5y/Yn5Mw7Dx3ZPHUcygpslyZ6v9Da5T3Z7dKcmaVwxJ+H
+n3wcugv0EIHvOPLNK8npovINR6rGVj6BAqD0uZHKYYYEioQxK5rGyGkaoDQ+dgHm
+qku12wKBgQDem5FvNp5iW7mufkPZMqf3sEGtu612QeqejIPFM1z7VkUgetsgPBXD
+tYsqC2FtWzY51VOEKNpnfH7zH5n+bjoI9nAEAW63TK9ZKkr2hRGsDhJdGzmLfQ7v
+F6/CuIw9EsAq6qIB8O88FXQqald+BZOx6AzB8Oedsz/WtMmIEmr/+Q==
+-----END RSA PRIVATE KEY-----";
+
+#[cfg(all(feature = "transport_tls", target_family = "unix"))]
+const CLIENT_CERT: &str = "-----BEGIN CERTIFICATE-----
+MIIDLjCCAhagAwIBAgIIeUtmIdFQznMwDQYJKoZIhvcNAQELBQAwIDEeMBwGA1UE
+AxMVbWluaWNhIHJvb3QgY2EgMDc4ZGE3MCAXDTIzMDMwNjE2MDMxOFoYDzIxMjMw
+MzA2MTYwMzE4WjAUMRIwEAYDVQQDEwlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEB
+AQUAA4IBDwAwggEKAoIBAQCx+oC6ESU3gefJ6oui9J3hB76c2/kDAKNI74cWIXfT
+He9DUeKpEDRSbIWVKoGcUfdNQebglxp3jRB+tfx/XU0oZl2m8oewxipiNmdiREUZ
+Lazh9DJoNtXkzTqzdQNfwRM+BjjVjx8IpNJV2L2IeTBxWtczFS7ggEHHQLWvYZKj
+eCQgGdRwQt0V1pQ5Jt0KKkmFueTCLESvaHs9fHBtrtIhmBm1FpBZqTVUT1vvXqp7
+eIy4yFoR+j9SgWZ5kI+7myl/Bo5mycKzFE+TYiNvOWwdMnT2Uz3CZsQUcExUBd6M
+tOT75Kte3yMBJmE16f/YbPItA0Cq4af3yUIxDpKwT28tAgMBAAGjdjB0MA4GA1Ud
+DwEB/wQEAwIFoDAdBgNVHSUEFjAUBggrBgEFBQcDAQYIKwYBBQUHAwIwDAYDVR0T
+AQH/BAIwADAfBgNVHSMEGDAWgBTWfAmQ/BUIQm/9/llJJs2jUMWzGzAUBgNVHREE
+DTALgglsb2NhbGhvc3QwDQYJKoZIhvcNAQELBQADggEBAG/POnBob0S7iYwsbtI2
+3LTTbRnmseIErtJuJmI9yYzgVIm6sUSKhlIUfAIm4rfRuzE94KFeWR2w9RabxOJD
+wjYLLKvQ6rFY5g2AV/J0TwDjYuq0absdaDPZ8MKJ+/lpGYK3Te+CTOfq5FJRFt1q
+GOkXAxnNpGg0obeRWRKFiAMHbcw6a8LIMfRjCooo3+uSQGsbVzGxSB4CYo720KcC
+9vB1K9XALwzoqCewP4aiQsMY1GWpAmzXJftY3w+lka0e9dBYcdEdOqxSoZb5OBBZ
+p5e60QweRuJsb60aUaCG8HoICevXYK2fFqCQdlb5sIqQqXyN2K6HuKAFywsjsGyJ
+abY=
+-----END CERTIFICATE-----";
+
+#[cfg(all(feature = "transport_tls", target_family = "unix"))]
+const CLIENT_CA: &str = "-----BEGIN CERTIFICATE-----
+MIIDSzCCAjOgAwIBAgIIB42n1ZIkOakwDQYJKoZIhvcNAQELBQAwIDEeMBwGA1UE
+AxMVbWluaWNhIHJvb3QgY2EgMDc4ZGE3MCAXDTIzMDMwNjE2MDMwN1oYDzIxMjMw
+MzA2MTYwMzA3WjAgMR4wHAYDVQQDExVtaW5pY2Egcm9vdCBjYSAwNzhkYTcwggEi
+MA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDIuCq24O4P4Aep5vAVlrIQ7P8+
+uWWgcHIFYa02TmhBUB/hjo0JANCQvAtpVNuQ8NyKPlqnnq1cttePbSYVeA0rrnOs
+DcfySAiyGBEY9zMjFfHJtH1wtrPcJEU8XIEY3xUlrAJE2CEuV9dVYgfEEydnvgLc
+8Ug0WXSiARjqbnMW3l8jh6bYCp/UpL/gSM4mxdKrgpfyPoweGhlOWXc3RTS7cqM9
+T25acURGOSI6/g8GF0sNE4VZmUvHggSTmsbLeXMJzxDWO+xVehRmbQx3IkG7u++b
+QdRwGIJcDNn7zHlDMHtQ0Z1DBV94fZNBwCULhCBB5g20XTGw//S7Fj2FPwyhAgMB
+AAGjgYYwgYMwDgYDVR0PAQH/BAQDAgKEMB0GA1UdJQQWMBQGCCsGAQUFBwMBBggr
+BgEFBQcDAjASBgNVHRMBAf8ECDAGAQH/AgEAMB0GA1UdDgQWBBTWfAmQ/BUIQm/9
+/llJJs2jUMWzGzAfBgNVHSMEGDAWgBTWfAmQ/BUIQm/9/llJJs2jUMWzGzANBgkq
+hkiG9w0BAQsFAAOCAQEAvtcZFAELKiTuOiAeYts6zeKxc+nnHCzayDeD/BDCbxGJ
+e1n+xdHjLtWGd+/Anc+fvftSYBPTFQqCi84lPiUIln5z/rUxE+ke81hNPIfw2obc
+yIg87xCabQpVyEh8s+MV+7YPQ1+fH4FuSi2Fck1FejxkVqN2uOZPvOYUmSTsaVr1
+8SfRnwJNZ9UMRPM2bD4Jkvj0VcL42JM3QkOClOzYW4j/vll2cSs4kx7er27cIoo1
+Ck0v2xSPAiVjg6w65rUQeW6uB5m0T2wyj+wm0At8vzhZPlgS1fKhcmT2dzOq3+oN
+R+IdLiXcyIkg0m9N8I17p0ljCSkbrgGMD3bbePRTfg==
+-----END CERTIFICATE-----";
+
+#[cfg(any(feature = "transport_tls", feature = "transport_quic"))]
+const SERVER_KEY: &str = "-----BEGIN RSA PRIVATE KEY-----
+MIIEpAIBAAKCAQEAmDCySqKHPmEZShDH3ldPaV/Zsh9+HlHFLk9H10vJZj5WfzVu
+5puZQ8GvBFIOtVrl0L9qLkA6bZiHHXm/8OEVvd135ZMp4NV23fdTsEASXfvGVQY8
+y+4UkZN0Dw6sfwlQVPyNRplys2+nFs6tX05Dp9VizV39tSOqe/jd6hyzxSUHqFat
+RwQRXAI04CZ6ckDb0Riw7i0yvjrFhBom9lPKq4IkXZGgS5MRl0pRgAZTqHEMlv8z
+oX+KcG9mfyQIHtpkVuSHHsQjwVop7fMnT7KCQ3bPI+fgMmAg+h1IR19Dm0JM+9zl
+u39j0IbkytrsystGM+pTRbdp7s2lgtOMCFt0+wIDAQABAoIBADNTSO2uvlmlOXgn
+DKDJZTiuYKaXxFrJTOx/REUxg+x9XYJtLMeM9jVJnpKgceFrlFHAHDkY5BuN8xNX
+ugmsfz6W8BZ2eQsgMoRNIuYv1YHopUyLW/mSg1FNHzjsw/Pb2kGvIp4Kpgopv3oL
+naCkrmBtsHJ+Hk/2hUpl9cE8iMwVWcVevLzyHi98jNy1IDdIPhRtl0dhMiqC5MRr
+4gLJ5gNkLYX7xf3tw5Hmfk/bVNProqZXDIQVI7rFvItX586nvQ3LNQkmW/D2ShZf
+3FEqMu6EdA2Ycc4UZgAlQNGV0VBrWWVXizOQ+9gjLnBk3kJjqfigCU6NG94bTJ+H
+0YIhsGECgYEAwdSSyuMSOXgzZQ7Vv+GsNn/7ivi/H8eb/lDzksqS/JroA2ciAmHG
+2OF30eUJKRg+STqBTpOfXgS4QUa8QLSwBSnwcw6579x9bYGUhqD2Ypaw9uCnOukA
+CwwggZ9cDmF0tb5rYjqkW3bFPqkCnTGb0ylMFaYRhRDU20iG5t8PQckCgYEAyQEM
+KK18FLQUKivGrQgP5Ib6IC3myzlHGxDzfobXGpaQntFnHY7Cxp/6BBtmASzt9Jxu
+etnrevmzrbKqsLTJSg3ivbiq0YTLAJ1FsZrCp71dx49YR/5o9QFiq0nQoKnwUVeb
+/hrDjMAokNkjFL5vouXO711GSS6YyM4WzAKZAqMCgYEAhqGxaG06jmJ4SFx6ibIl
+nSFeRhQrJNbP+mCeHrrIR98NArgS/laN+Lz7LfaJW1r0gIa7pCmTi4l5thV80vDu
+RlfwJOr4qaucD4Du+mg5WxdSSdiXL6sBlarRtVdMaMy2dTqTegJDgShJLxHTt/3q
+P0yzBWJ5TtT3FG0XDqum/EkCgYAYNHwWWe3bQGQ9P9BI/fOL/YUZYu2sA1XAuKXZ
+0rsMhJ0dwvG76XkjGhitbe82rQZqsnvLZ3qn8HHmtOFBLkQfGtT3K8nGOUuI42eF
+H7HZKUCly2lCIizZdDVBkz4AWvaJlRc/3lE2Hd3Es6E52kTvROVKhdz06xuS8t5j
+6twqKQKBgQC01AeiWL6Rzo+yZNzVgbpeeDogaZz5dtmURDgCYH8yFX5eoCKLHfnI
+2nDIoqpaHY0LuX+dinuH+jP4tlyndbc2muXnHd9r0atytxA69ay3sSA5WFtfi4ef
+ESElGO6qXEA821RpQp+2+uhL90+iC294cPqlS5LDmvTMypVDHzrxPQ==
+-----END RSA PRIVATE KEY-----";
+
+#[cfg(any(feature = "transport_tls", feature = "transport_quic"))]
+const SERVER_CERT: &str = "-----BEGIN CERTIFICATE-----
+MIIDLjCCAhagAwIBAgIIW1mAtJWJAJYwDQYJKoZIhvcNAQELBQAwIDEeMBwGA1UE
+AxMVbWluaWNhIHJvb3QgY2EgNGRjYzJmMCAXDTIzMDMwNjE2NDEwNloYDzIxMjMw
+MzA2MTY0MTA2WjAUMRIwEAYDVQQDEwlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEB
+AQUAA4IBDwAwggEKAoIBAQCYMLJKooc+YRlKEMfeV09pX9myH34eUcUuT0fXS8lm
+PlZ/NW7mm5lDwa8EUg61WuXQv2ouQDptmIcdeb/w4RW93Xflkyng1Xbd91OwQBJd
++8ZVBjzL7hSRk3QPDqx/CVBU/I1GmXKzb6cWzq1fTkOn1WLNXf21I6p7+N3qHLPF
+JQeoVq1HBBFcAjTgJnpyQNvRGLDuLTK+OsWEGib2U8qrgiRdkaBLkxGXSlGABlOo
+cQyW/zOhf4pwb2Z/JAge2mRW5IcexCPBWint8ydPsoJDds8j5+AyYCD6HUhHX0Ob
+Qkz73OW7f2PQhuTK2uzKy0Yz6lNFt2nuzaWC04wIW3T7AgMBAAGjdjB0MA4GA1Ud
+DwEB/wQEAwIFoDAdBgNVHSUEFjAUBggrBgEFBQcDAQYIKwYBBQUHAwIwDAYDVR0T
+AQH/BAIwADAfBgNVHSMEGDAWgBTX46+p+Po1npE6QLQ7mMI+83s6qDAUBgNVHREE
+DTALgglsb2NhbGhvc3QwDQYJKoZIhvcNAQELBQADggEBAAxrmQPG54ybKgMVliN8
+Mg5povSdPIVVnlU/HOVG9yxzAOav/xQP003M4wqpatWxI8tR1PcLuZf0EPmcdJgb
+tVl9nZMVZtveQnYMlU8PpkEVu56VM4Zr3rH9liPRlr0JEAXODdKw76kWKzmdqWZ/
+rzhup3Ek7iEX6T5j/cPUvTWtMD4VEK2I7fgoKSHIX8MIVzqM7cuboGWPtS3eRNXl
+MgvahA4TwLEXPEe+V1WAq6nSb4g2qSXWIDpIsy/O1WGS/zzRnKvXu9/9NkXWqZMl
+C1LSpiiQUaRSglOvYf/Zx6r+4BOS4OaaArwHkecZQqBSCcBLEAyb/FaaXdBowI0U
+PQ4=
+-----END CERTIFICATE-----";
+
+#[cfg(any(feature = "transport_tls", feature = "transport_quic"))]
+const SERVER_CA: &str = "-----BEGIN CERTIFICATE-----
+MIIDSzCCAjOgAwIBAgIITcwv1N10nqEwDQYJKoZIhvcNAQELBQAwIDEeMBwGA1UE
+AxMVbWluaWNhIHJvb3QgY2EgNGRjYzJmMCAXDTIzMDMwNjE2NDEwNloYDzIxMjMw
+MzA2MTY0MTA2WjAgMR4wHAYDVQQDExVtaW5pY2Egcm9vdCBjYSA0ZGNjMmYwggEi
+MA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQC2WUgN7NMlXIknew1cXiTWGmS0
+1T1EjcNNDAq7DqZ7/ZVXrjD47yxTt5EOiOXK/cINKNw4Zq/MKQvq9qu+Oax4lwiV
+Ha0i8ShGLSuYI1HBlXu4MmvdG+3/SjwYoGsGaShr0y/QGzD3cD+DQZg/RaaIPHlO
+MdmiUXxkMcy4qa0hFJ1imlJdq/6Tlx46X+0vRCh8nkekvOZR+t7Z5U4jn4XE54Kl
+0PiwcyX8vfDZ3epa/FSHZvVQieM/g5Yh9OjIKCkdWRg7tD0IEGsaW11tEPJ5SiQr
+mDqdRneMzZKqY0xC+QqXSvIlzpOjiu8PYQx7xugaUFE/npKRQdvh8ojHJMdNAgMB
+AAGjgYYwgYMwDgYDVR0PAQH/BAQDAgKEMB0GA1UdJQQWMBQGCCsGAQUFBwMBBggr
+BgEFBQcDAjASBgNVHRMBAf8ECDAGAQH/AgEAMB0GA1UdDgQWBBTX46+p+Po1npE6
+QLQ7mMI+83s6qDAfBgNVHSMEGDAWgBTX46+p+Po1npE6QLQ7mMI+83s6qDANBgkq
+hkiG9w0BAQsFAAOCAQEAaN0IvEC677PL/JXzMrXcyBV88IvimlYN0zCt48GYlhmx
+vL1YUDFLJEB7J+dyERGE5N6BKKDGblC4WiTFgDMLcHFsMGRc0v7zKPF1PSBwRYJi
+ubAmkwdunGG5pDPUYtTEDPXMlgClZ0YyqSFJMOqA4IzQg6exVjXtUxPqzxNhyC7S
+vlgUwPbX46uNi581a9+Ls2V3fg0ZnhkTSctYZHGZNeh0Nsf7Am8xdUDYG/bZcVef
+jbQ9gpChosdjF0Bgblo7HSUct/2Va+YlYwW+WFjJX8k4oN6ZU5W5xhdfO8Czmgwk
+US5kJ/+1M0uR8zUhZHL61FbsdPxEj+fYKrHv4woo+A==
+-----END CERTIFICATE-----";
 
 const TIMEOUT: Duration = Duration::from_secs(60);
 const SLEEP: Duration = Duration::from_secs(1);
@@ -148,7 +328,8 @@ impl TransportPeerEventHandler for SCClient {
 }
 
 async fn open_transport(
-    endpoints: &[EndPoint],
+    client_endpoints: &[EndPoint],
+    server_endpoints: &[EndPoint],
 ) -> (
     TransportManager,
     Arc<SHRouter>,
@@ -156,39 +337,39 @@ async fn open_transport(
     TransportUnicast,
 ) {
     // Define client and router IDs
-    let client_id = PeerId::new(1, [0_u8; PeerId::MAX_SIZE]);
-    let router_id = PeerId::new(1, [1_u8; PeerId::MAX_SIZE]);
+    let client_id = ZenohId::try_from([1]).unwrap();
+    let router_id = ZenohId::try_from([2]).unwrap();
 
     // Create the router transport manager
     let router_handler = Arc::new(SHRouter::default());
-    let unicast = TransportManager::config_unicast().max_links(endpoints.len());
+    let unicast = TransportManager::config_unicast().max_links(server_endpoints.len());
 
     let router_manager = TransportManager::builder()
-        .pid(router_id)
+        .zid(router_id)
         .whatami(WhatAmI::Router)
         .unicast(unicast)
         .build(router_handler.clone())
         .unwrap();
 
+    // Create the listener on the router
+    for e in server_endpoints.iter() {
+        println!("Add endpoint: {e}\n");
+        let _ = ztimeout!(router_manager.add_listener(e.clone())).unwrap();
+    }
+
     // Create the client transport manager
-    let unicast = TransportManager::config_unicast().max_links(endpoints.len());
+    let unicast = TransportManager::config_unicast().max_links(client_endpoints.len());
     let client_manager = TransportManager::builder()
         .whatami(WhatAmI::Client)
-        .pid(client_id)
+        .zid(client_id)
         .unicast(unicast)
         .build(Arc::new(SHClient::default()))
         .unwrap();
 
-    // Create the listener on the router
-    for e in endpoints.iter() {
-        println!("Add endpoint: {}", e);
-        let _ = ztimeout!(router_manager.add_listener(e.clone())).unwrap();
-    }
-
     // Create an empty transport with the client
     // Open transport -> This should be accepted
-    for e in endpoints.iter() {
-        println!("Opening transport with {}", e);
+    for e in client_endpoints.iter() {
+        println!("Opening transport with {e}");
         let _ = ztimeout!(client_manager.open_transport(e.clone())).unwrap();
     }
 
@@ -212,9 +393,9 @@ async fn close_transport(
     // Close the client transport
     let mut ee = String::new();
     for e in endpoints.iter() {
-        write!(ee, "{} ", e).unwrap();
+        let _ = write!(ee, "{e} ");
     }
-    println!("Closing transport with {}", ee);
+    println!("Closing transport with {ee}");
     ztimeout!(client_transport.close()).unwrap();
 
     ztimeout!(async {
@@ -225,7 +406,7 @@ async fn close_transport(
 
     // Stop the locators on the manager
     for e in endpoints.iter() {
-        println!("Del locator: {}", e);
+        println!("Del locator: {e}");
         ztimeout!(router_manager.del_listener(e)).unwrap();
     }
 
@@ -252,7 +433,7 @@ async fn test_transport(
     msg_size: usize,
 ) {
     // Create the message to send
-    let key = "/test".into();
+    let key = "test".into();
     let payload = ZBuf::from(vec![0_u8; msg_size]);
     let data_info = None;
     let routing_context = None;
@@ -269,10 +450,7 @@ async fn test_transport(
         attachment,
     );
 
-    println!(
-        "Sending {} messages... {:?} {}",
-        MSG_COUNT, channel, msg_size
-    );
+    println!("Sending {MSG_COUNT} messages... {channel:?} {msg_size}");
     for _ in 0..MSG_COUNT {
         client_transport.schedule(message.clone()).unwrap();
     }
@@ -298,10 +476,15 @@ async fn test_transport(
     task::sleep(SLEEP).await;
 }
 
-async fn run_single(endpoints: &[EndPoint], channel: Channel, msg_size: usize) {
+async fn run_single(
+    client_endpoints: &[EndPoint],
+    server_endpoints: &[EndPoint],
+    channel: Channel,
+    msg_size: usize,
+) {
     #[allow(unused_variables)] // Used when stats feature is enabled
     let (router_manager, router_handler, client_manager, client_transport) =
-        open_transport(endpoints).await;
+        open_transport(client_endpoints, server_endpoints).await;
 
     test_transport(
         router_handler.clone(),
@@ -314,22 +497,33 @@ async fn run_single(endpoints: &[EndPoint], channel: Channel, msg_size: usize) {
     #[cfg(feature = "stats")]
     {
         let c_stats = client_transport.get_stats().unwrap();
-        println!("\tClient: {:?}", c_stats,);
+        println!("\tClient: {c_stats:?}");
         let r_stats = router_manager
-            .get_transport_unicast(&client_manager.config.pid)
+            .get_transport_unicast(&client_manager.config.zid)
             .unwrap()
             .get_stats()
             .unwrap();
-        println!("\tRouter: {:?}", r_stats);
+        println!("\tRouter: {r_stats:?}");
     }
 
-    close_transport(router_manager, client_manager, client_transport, endpoints).await;
+    close_transport(
+        router_manager,
+        client_manager,
+        client_transport,
+        client_endpoints,
+    )
+    .await;
 }
 
-async fn run(endpoints: &[EndPoint], channel: &[Channel], msg_size: &[usize]) {
+async fn run(
+    client_endpoints: &[EndPoint],
+    server_endpoints: &[EndPoint],
+    channel: &[Channel],
+    msg_size: &[usize],
+) {
     for ch in channel.iter() {
         for ms in msg_size.iter() {
-            run_single(endpoints, *ch, *ms).await;
+            run_single(client_endpoints, server_endpoints, *ch, *ms).await;
         }
     }
 }
@@ -337,14 +531,15 @@ async fn run(endpoints: &[EndPoint], channel: &[Channel], msg_size: &[usize]) {
 #[cfg(feature = "transport_tcp")]
 #[test]
 fn transport_unicast_tcp_only() {
+    let _ = env_logger::try_init();
     task::block_on(async {
         zasync_executor_init!();
     });
 
     // Define the locators
     let endpoints: Vec<EndPoint> = vec![
-        "tcp/127.0.0.1:10447".parse().unwrap(),
-        "tcp/[::1]:10447".parse().unwrap(),
+        format!("tcp/127.0.0.1:{}", 16000).parse().unwrap(),
+        format!("tcp/[::1]:{}", 16001).parse().unwrap(),
     ];
     // Define the reliability and congestion control
     let channel = [
@@ -366,20 +561,21 @@ fn transport_unicast_tcp_only() {
         },
     ];
     // Run
-    task::block_on(run(&endpoints, &channel, &MSG_SIZE_ALL));
+    task::block_on(run(&endpoints, &endpoints, &channel, &MSG_SIZE_ALL));
 }
 
 #[cfg(feature = "transport_udp")]
 #[test]
 fn transport_unicast_udp_only() {
+    let _ = env_logger::try_init();
     task::block_on(async {
         zasync_executor_init!();
     });
 
     // Define the locator
     let endpoints: Vec<EndPoint> = vec![
-        "udp/127.0.0.1:10447".parse().unwrap(),
-        "udp/[::1]:10447".parse().unwrap(),
+        format!("udp/127.0.0.1:{}", 16010).parse().unwrap(),
+        format!("udp/[::1]:{}", 16011).parse().unwrap(),
     ];
     // Define the reliability and congestion control
     let channel = [
@@ -393,21 +589,21 @@ fn transport_unicast_udp_only() {
         },
     ];
     // Run
-    task::block_on(run(&endpoints, &channel, &MSG_SIZE_NOFRAG));
+    task::block_on(run(&endpoints, &endpoints, &channel, &MSG_SIZE_NOFRAG));
 }
 
 #[cfg(all(feature = "transport_unixsock-stream", target_family = "unix"))]
 #[test]
 fn transport_unicast_unix_only() {
+    let _ = env_logger::try_init();
     task::block_on(async {
         zasync_executor_init!();
     });
 
-    let _ = std::fs::remove_file("zenoh-test-unix-socket-5.sock");
+    let f1 = "zenoh-test-unix-socket-5.sock";
+    let _ = std::fs::remove_file(f1);
     // Define the locator
-    let endpoints: Vec<EndPoint> = vec!["unixsock-stream/zenoh-test-unix-socket-5.sock"
-        .parse()
-        .unwrap()];
+    let endpoints: Vec<EndPoint> = vec![format!("unixsock-stream/{f1}").parse().unwrap()];
     // Define the reliability and congestion control
     let channel = [
         Channel {
@@ -420,22 +616,23 @@ fn transport_unicast_unix_only() {
         },
     ];
     // Run
-    task::block_on(run(&endpoints, &channel, &MSG_SIZE_ALL));
-    let _ = std::fs::remove_file("zenoh-test-unix-socket-5.sock");
-    let _ = std::fs::remove_file("zenoh-test-unix-socket-5.sock.lock");
+    task::block_on(run(&endpoints, &endpoints, &channel, &MSG_SIZE_ALL));
+    let _ = std::fs::remove_file(f1);
+    let _ = std::fs::remove_file(format!("{f1}.lock"));
 }
 
 #[cfg(feature = "transport_ws")]
 #[test]
 fn transport_unicast_ws_only() {
+    let _ = env_logger::try_init();
     task::block_on(async {
         zasync_executor_init!();
     });
 
     // Define the locators
     let endpoints: Vec<EndPoint> = vec![
-        "ws/127.0.0.1:11447".parse().unwrap(),
-        "ws/[::1]:11447".parse().unwrap(),
+        format!("ws/127.0.0.1:{}", 16020).parse().unwrap(),
+        format!("ws/[::1]:{}", 16021).parse().unwrap(),
     ];
     // Define the reliability and congestion control
     let channel = [
@@ -457,22 +654,23 @@ fn transport_unicast_ws_only() {
         },
     ];
     // Run
-    task::block_on(run(&endpoints, &channel, &MSG_SIZE_ALL));
+    task::block_on(run(&endpoints, &endpoints, &channel, &MSG_SIZE_ALL));
 }
 
 #[cfg(all(feature = "transport_tcp", feature = "transport_udp"))]
 #[test]
 fn transport_unicast_tcp_udp() {
+    let _ = env_logger::try_init();
     task::block_on(async {
         zasync_executor_init!();
     });
 
     // Define the locator
     let endpoints: Vec<EndPoint> = vec![
-        "tcp/127.0.0.1:10448".parse().unwrap(),
-        "udp/127.0.0.1:10448".parse().unwrap(),
-        "tcp/[::1]:10448".parse().unwrap(),
-        "udp/[::1]:10448".parse().unwrap(),
+        format!("tcp/127.0.0.1:{}", 16030).parse().unwrap(),
+        format!("udp/127.0.0.1:{}", 16031).parse().unwrap(),
+        format!("tcp/[::1]:{}", 16032).parse().unwrap(),
+        format!("udp/[::1]:{}", 16033).parse().unwrap(),
     ];
     // Define the reliability and congestion control
     let channel = [
@@ -486,7 +684,7 @@ fn transport_unicast_tcp_udp() {
         },
     ];
     // Run
-    task::block_on(run(&endpoints, &channel, &MSG_SIZE_NOFRAG));
+    task::block_on(run(&endpoints, &endpoints, &channel, &MSG_SIZE_NOFRAG));
 }
 
 #[cfg(all(
@@ -496,18 +694,18 @@ fn transport_unicast_tcp_udp() {
 ))]
 #[test]
 fn transport_unicast_tcp_unix() {
+    let _ = env_logger::try_init();
     task::block_on(async {
         zasync_executor_init!();
     });
 
-    let _ = std::fs::remove_file("zenoh-test-unix-socket-6.sock");
+    let f1 = "zenoh-test-unix-socket-6.sock";
+    let _ = std::fs::remove_file(f1);
     // Define the locator
     let endpoints: Vec<EndPoint> = vec![
-        "tcp/127.0.0.1:10449".parse().unwrap(),
-        "tcp/[::1]:10449".parse().unwrap(),
-        "unixsock-stream/zenoh-test-unix-socket-6.sock"
-            .parse()
-            .unwrap(),
+        format!("tcp/127.0.0.1:{}", 16040).parse().unwrap(),
+        format!("tcp/[::1]:{}", 16041).parse().unwrap(),
+        format!("unixsock-stream/{f1}").parse().unwrap(),
     ];
     // Define the reliability and congestion control
     let channel = [
@@ -521,9 +719,9 @@ fn transport_unicast_tcp_unix() {
         },
     ];
     // Run
-    task::block_on(run(&endpoints, &channel, &MSG_SIZE_ALL));
-    let _ = std::fs::remove_file("zenoh-test-unix-socket-6.sock");
-    let _ = std::fs::remove_file("zenoh-test-unix-socket-6.sock.lock");
+    task::block_on(run(&endpoints, &endpoints, &channel, &MSG_SIZE_ALL));
+    let _ = std::fs::remove_file(f1);
+    let _ = std::fs::remove_file(format!("{f1}.lock"));
 }
 
 #[cfg(all(
@@ -533,18 +731,18 @@ fn transport_unicast_tcp_unix() {
 ))]
 #[test]
 fn transport_unicast_udp_unix() {
+    let _ = env_logger::try_init();
     task::block_on(async {
         zasync_executor_init!();
     });
 
-    let _ = std::fs::remove_file("zenoh-test-unix-socket-7.sock");
+    let f1 = "zenoh-test-unix-socket-7.sock";
+    let _ = std::fs::remove_file(f1);
     // Define the locator
     let endpoints: Vec<EndPoint> = vec![
-        "udp/127.0.0.1:10449".parse().unwrap(),
-        "udp/[::1]:10449".parse().unwrap(),
-        "unixsock-stream/zenoh-test-unix-socket-7.sock"
-            .parse()
-            .unwrap(),
+        format!("udp/127.0.0.1:{}", 16050).parse().unwrap(),
+        format!("udp/[::1]:{}", 16051).parse().unwrap(),
+        format!("unixsock-stream/{f1}").parse().unwrap(),
     ];
     // Define the reliability and congestion control
     let channel = [
@@ -558,9 +756,9 @@ fn transport_unicast_udp_unix() {
         },
     ];
     // Run
-    task::block_on(run(&endpoints, &channel, &MSG_SIZE_NOFRAG));
-    let _ = std::fs::remove_file("zenoh-test-unix-socket-7.sock");
-    let _ = std::fs::remove_file("zenoh-test-unix-socket-7.sock.lock");
+    task::block_on(run(&endpoints, &endpoints, &channel, &MSG_SIZE_NOFRAG));
+    let _ = std::fs::remove_file(f1);
+    let _ = std::fs::remove_file(format!("{f1}.lock"));
 }
 
 #[cfg(all(
@@ -571,20 +769,20 @@ fn transport_unicast_udp_unix() {
 ))]
 #[test]
 fn transport_unicast_tcp_udp_unix() {
+    let _ = env_logger::try_init();
     task::block_on(async {
         zasync_executor_init!();
     });
 
-    let _ = std::fs::remove_file("zenoh-test-unix-socket-8.sock");
+    let f1 = "zenoh-test-unix-socket-8.sock";
+    let _ = std::fs::remove_file(f1);
     // Define the locator
     let endpoints: Vec<EndPoint> = vec![
-        "tcp/127.0.0.1:10450".parse().unwrap(),
-        "udp/127.0.0.1:10450".parse().unwrap(),
-        "tcp/[::1]:10450".parse().unwrap(),
-        "udp/[::1]:10450".parse().unwrap(),
-        "unixsock-stream/zenoh-test-unix-socket-8.sock"
-            .parse()
-            .unwrap(),
+        format!("tcp/127.0.0.1:{}", 16060).parse().unwrap(),
+        format!("udp/127.0.0.1:{}", 16061).parse().unwrap(),
+        format!("tcp/[::1]:{}", 16062).parse().unwrap(),
+        format!("udp/[::1]:{}", 16063).parse().unwrap(),
+        format!("unixsock-stream/{f1}").parse().unwrap(),
     ];
     // Define the reliability and congestion control
     let channel = [
@@ -598,105 +796,151 @@ fn transport_unicast_tcp_udp_unix() {
         },
     ];
     // Run
-    task::block_on(run(&endpoints, &channel, &MSG_SIZE_NOFRAG));
-    let _ = std::fs::remove_file("zenoh-test-unix-socket-8.sock");
-    let _ = std::fs::remove_file("zenoh-test-unix-socket-8.sock.lock");
+    task::block_on(run(&endpoints, &endpoints, &channel, &MSG_SIZE_NOFRAG));
+    let _ = std::fs::remove_file(f1);
+    let _ = std::fs::remove_file(format!("{f1}.lock"));
 }
 
 #[cfg(all(feature = "transport_tls", target_family = "unix"))]
 #[test]
-fn transport_unicast_tls_only() {
+fn transport_unicast_tls_only_server() {
+    use zenoh_link::tls::config::*;
+
+    let _ = env_logger::try_init();
+    task::block_on(async {
+        zasync_executor_init!();
+    });
+
+    // Define the locator
+    let mut endpoint: EndPoint = format!("tls/localhost:{}", 16070).parse().unwrap();
+    endpoint
+        .config_mut()
+        .extend(
+            [
+                (TLS_ROOT_CA_CERTIFICATE_RAW, SERVER_CA),
+                (TLS_SERVER_CERTIFICATE_RAW, SERVER_CERT),
+                (TLS_SERVER_PRIVATE_KEY_RAW, SERVER_KEY),
+            ]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+        )
+        .unwrap();
+
+    // Define the reliability and congestion control
+    let channel = [
+        Channel {
+            priority: Priority::default(),
+            reliability: Reliability::Reliable,
+        },
+        Channel {
+            priority: Priority::default(),
+            reliability: Reliability::BestEffort,
+        },
+        Channel {
+            priority: Priority::RealTime,
+            reliability: Reliability::Reliable,
+        },
+        Channel {
+            priority: Priority::RealTime,
+            reliability: Reliability::BestEffort,
+        },
+    ];
+    // Run
+    let endpoints = vec![endpoint];
+    task::block_on(run(&endpoints, &endpoints, &channel, &MSG_SIZE_ALL));
+}
+
+#[cfg(feature = "transport_quic")]
+#[test]
+fn transport_unicast_quic_only_server() {
+    use zenoh_link::quic::config::*;
+
+    let _ = env_logger::try_init();
+    task::block_on(async {
+        zasync_executor_init!();
+    });
+
+    // Define the locator
+    let mut endpoint: EndPoint = format!("quic/localhost:{}", 16080).parse().unwrap();
+    endpoint
+        .config_mut()
+        .extend(
+            [
+                (TLS_ROOT_CA_CERTIFICATE_RAW, SERVER_CA),
+                (TLS_SERVER_CERTIFICATE_RAW, SERVER_CERT),
+                (TLS_SERVER_PRIVATE_KEY_RAW, SERVER_KEY),
+            ]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+        )
+        .unwrap();
+
+    // Define the reliability and congestion control
+    let channel = [
+        Channel {
+            priority: Priority::default(),
+            reliability: Reliability::Reliable,
+        },
+        Channel {
+            priority: Priority::default(),
+            reliability: Reliability::BestEffort,
+        },
+        Channel {
+            priority: Priority::RealTime,
+            reliability: Reliability::Reliable,
+        },
+        Channel {
+            priority: Priority::RealTime,
+            reliability: Reliability::BestEffort,
+        },
+    ];
+    // Run
+    let endpoints = vec![endpoint];
+    task::block_on(run(&endpoints, &endpoints, &channel, &MSG_SIZE_ALL));
+}
+
+#[cfg(all(feature = "transport_tls", target_family = "unix"))]
+#[test]
+fn transport_unicast_tls_only_mutual_success() {
     use zenoh_link::tls::config::*;
 
     task::block_on(async {
         zasync_executor_init!();
     });
 
-    // NOTE: this an auto-generated pair of certificate and key.
-    //       The target domain is localhost, so it has no real
-    //       mapping to any existing domain. The certificate and key
-    //       have been generated using: https://github.com/jsha/minica
-    let key = "-----BEGIN RSA PRIVATE KEY-----
-MIIEowIBAAKCAQEAz105EYUbOdW5uJ8o/TqtxtOtKJL7AQdy5yiXoslosAsulaew
-4JSJetVa6Fa6Bq5BK6fsphGD9bpGGeiBZFBt75JRjOrkj4DwlLGa0CPLTgG5hul4
-Ufe9B7VG3J5P8OwUqIYmPzj8uTbNtkgFRcYumHR28h4GkYdG5Y04AV4vIjgKE47j
-AgV5ACRHkcmGrTzF2HOes2wT73l4yLSkKR4GlIWu5cLRdI8PTUmjMFAh/GIh1ahd
-+VqXz051V3jok0n1klVNjc6DnWuH3j/MSOg/52C3YfcUjCeIJGVfcqDnPTJKSNEF
-yVTYCUjWy+B0B4fMz3MpU17dDWpvS5hfc4VrgQIDAQABAoIBAQCq+i208XBqdnwk
-6y7r5Tcl6qErBE3sIk0upjypX7Ju/TlS8iqYckENQ+AqFGBcY8+ehF5O68BHm2hz
-sk8F/H84+wc8zuzYGjPEFtEUb38RecCUqeqog0Gcmm6sN+ioOLAr6DifBojy2mox
-sx6N0oPW9qigp/s4gTcGzTLxhcwNRHWuoWjQwq6y6qwt2PJXnllii5B5iIJhKAxE
-EOmcVCmFbPavQ1Xr9F5jd5rRc1TYq28hXX8dZN2JhdVUbLlHzaiUfTnA/8yI4lyq
-bEmqu29Oqe+CmDtB6jRnrLiIwyZxzXKuxXaO6NqgxqtaVjLcdISEgZMeHEftuOtf
-C1xxodaVAoGBAOb1Y1SvUGx+VADSt1d30h3bBm1kU/1LhLKZOAQrnFMrEfyOfYbz
-AZ4FJgXE6ZsB1BA7hC0eJDVHz8gTgDJQrOOO8WJWDGRe4TbZkCi5IizYg5UH/6az
-I/WKlfdA4j1tftbQhycHL+9bGzdoRzrwIK489PG4oVAJJCaK2CVtx+l3AoGBAOXY
-75sHOiMaIvDA7qlqFbaBkdi1NzH7bCgy8IntNfLxlOCmGjxeNZzKrkode3JWY9SI
-Mo/nuWj8EZBEHj5omCapzOtkW/Nhnzc4C6U3BCspdrQ4mzbmzEGTdhqvxepa7U7K
-iRcoD1iU7kINCEwg2PsB/BvCSrkn6lpIJlYXlJDHAoGAY7QjgXd9fJi8ou5Uf8oW
-RxU6nRbmuz5Sttc2O3aoMa8yQJkyz4Mwe4s1cuAjCOutJKTM1r1gXC/4HyNsAEyb
-llErG4ySJPJgv1EEzs+9VSbTBw9A6jIDoAiH3QmBoYsXapzy+4I6y1XFVhIKTgND
-2HQwOfm+idKobIsb7GyMFNkCgYBIsixWZBrHL2UNsHfLrXngl2qBmA81B8hVjob1
-mMkPZckopGB353Qdex1U464/o4M/nTQgv7GsuszzTBgktQAqeloNuVg7ygyJcnh8
-cMIoxJx+s8ijvKutse4Q0rdOQCP+X6CsakcwRSp2SZjuOxVljmMmhHUNysocc+Vs
-JVkf0QKBgHiCVLU60EoPketADvhRJTZGAtyCMSb3q57Nb0VIJwxdTB5KShwpul1k
-LPA8Z7Y2i9+IEXcPT0r3M+hTwD7noyHXNlNuzwXot4B8PvbgKkMLyOpcwBjppJd7
-ns4PifoQbhDFnZPSfnrpr+ZXSEzxtiyv7Ql69jznl/vB8b75hBL4
------END RSA PRIVATE KEY-----";
-
-    let cert = "-----BEGIN CERTIFICATE-----
-MIIDLDCCAhSgAwIBAgIIIXlwQVKrtaAwDQYJKoZIhvcNAQELBQAwIDEeMBwGA1UE
-AxMVbWluaWNhIHJvb3QgY2EgMmJiOTlkMB4XDTIxMDIwMjE0NDYzNFoXDTIzMDMw
-NDE0NDYzNFowFDESMBAGA1UEAxMJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
-AAOCAQ8AMIIBCgKCAQEAz105EYUbOdW5uJ8o/TqtxtOtKJL7AQdy5yiXoslosAsu
-laew4JSJetVa6Fa6Bq5BK6fsphGD9bpGGeiBZFBt75JRjOrkj4DwlLGa0CPLTgG5
-hul4Ufe9B7VG3J5P8OwUqIYmPzj8uTbNtkgFRcYumHR28h4GkYdG5Y04AV4vIjgK
-E47jAgV5ACRHkcmGrTzF2HOes2wT73l4yLSkKR4GlIWu5cLRdI8PTUmjMFAh/GIh
-1ahd+VqXz051V3jok0n1klVNjc6DnWuH3j/MSOg/52C3YfcUjCeIJGVfcqDnPTJK
-SNEFyVTYCUjWy+B0B4fMz3MpU17dDWpvS5hfc4VrgQIDAQABo3YwdDAOBgNVHQ8B
-Af8EBAMCBaAwHQYDVR0lBBYwFAYIKwYBBQUHAwEGCCsGAQUFBwMCMAwGA1UdEwEB
-/wQCMAAwHwYDVR0jBBgwFoAULXa6lBiO7OLL5Z6XuF5uF5wR9PQwFAYDVR0RBA0w
-C4IJbG9jYWxob3N0MA0GCSqGSIb3DQEBCwUAA4IBAQBOMkNXfzPEDU475zbiSi3v
-JOhpZLyuoaYY62RzZc9VF8YRybJlWKUWdR3szAiUd1xCJe/beNX7b9lPg6wNadKq
-DGTWFmVxSfpVMO9GQYBXLDcNaAUXzsDLC5sbAFST7jkAJELiRn6KtQYxZ2kEzo7G
-QmzNMfNMc1KeL8Qr4nfEHZx642yscSWj9edGevvx4o48j5KXcVo9+pxQQFao9T2O
-F5QxyGdov+uNATWoYl92Gj8ERi7ovHimU3H7HLIwNPqMJEaX4hH/E/Oz56314E9b
-AXVFFIgCSluyrolaD6CWD9MqOex4YOfJR2bNxI7lFvuK4AwjyUJzT1U1HXib17mM
------END CERTIFICATE-----";
-
-    // Configure the client
-    let ca = "-----BEGIN CERTIFICATE-----
-MIIDSzCCAjOgAwIBAgIIK7mduKtTVxkwDQYJKoZIhvcNAQELBQAwIDEeMBwGA1UE
-AxMVbWluaWNhIHJvb3QgY2EgMmJiOTlkMCAXDTIxMDIwMjEzMTc0NVoYDzIxMjEw
-MjAyMTMxNzQ1WjAgMR4wHAYDVQQDExVtaW5pY2Egcm9vdCBjYSAyYmI5OWQwggEi
-MA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCoBZOxIfVq7LoEpVCMlQzuDnFy
-d+yuk5pFasEQvZ3IvWVta4rPFJ3WGl4UNF6v9bZegNHp+oo70guZ8ps9ez34qrwB
-rrNtZ0YJLDvR0ygloinZZeiclrZcu+x9vRdnyfWqrAulJBMlJIbbHcNx2OCkq7MM
-HdpLJMXxKVbIlQQYGUzRkNTAaK2PiFX5BaqmnZZyo7zNbz7L2asg+0K/FpiS2IRA
-coHPTa9BtsLUJUPRHPr08pgTjM1MQwa+Xxg1+wtMh85xdrqMi6Oe0cxefS+0L04F
-KVfMD3bW8AyuugvcTEpGnea2EvMoPfLWpnPGU3XO8lRZyotZDQzrPvNyYKM3AgMB
-AAGjgYYwgYMwDgYDVR0PAQH/BAQDAgKEMB0GA1UdJQQWMBQGCCsGAQUFBwMBBggr
-BgEFBQcDAjASBgNVHRMBAf8ECDAGAQH/AgEAMB0GA1UdDgQWBBQtdrqUGI7s4svl
-npe4Xm4XnBH09DAfBgNVHSMEGDAWgBQtdrqUGI7s4svlnpe4Xm4XnBH09DANBgkq
-hkiG9w0BAQsFAAOCAQEAJliEt607VUOSDsUeabhG8MIhYDhxe+mjJ4i7N/0xk9JU
-piCUdQr26HyYCzN+bNdjw663rxuVGtTTdHSw2CJHsPSOEDinbYkLMSyDeomsnr0S
-4e0hKUeqXXYg0iC/O2283ZEvvQK5SE+cjm0La0EmqO0mj3Mkc4Fsg8hExYuOur4M
-M0AufDKUhroksKKiCmjsFj1x55VcU45Ag8069lzBk7ntcGQpHUUkwZzvD4FXf8IR
-pVVHiH6WC99p77T9Di99dE5ufjsprfbzkuafgTo2Rz03HgPq64L4po/idP8uBMd6
-tOzot3pwe+3SJtpk90xAQrABEO0Zh2unrC8i83ySfg==
------END CERTIFICATE-----";
+    let client_auth = "true";
 
     // Define the locator
-    let mut endpoint: EndPoint = ("tls/localhost:10451").parse().unwrap();
-    endpoint.extend_configuration(
-        [
-            (TLS_ROOT_CA_CERTIFICATE_RAW, ca),
-            (TLS_SERVER_CERTIFICATE_RAW, cert),
-            (TLS_SERVER_PRIVATE_KEY_RAW, key),
-        ]
-        .iter()
-        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
-    );
+    let mut client_endpoint: EndPoint = ("tls/localhost:10461").parse().unwrap();
+    client_endpoint
+        .config_mut()
+        .extend(
+            [
+                (TLS_ROOT_CA_CERTIFICATE_RAW, SERVER_CA),
+                (TLS_CLIENT_CERTIFICATE_RAW, CLIENT_CERT),
+                (TLS_CLIENT_PRIVATE_KEY_RAW, CLIENT_KEY),
+                (TLS_CLIENT_AUTH, client_auth),
+            ]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+        )
+        .unwrap();
+
+    // Define the locator
+    let mut server_endpoint: EndPoint = ("tls/localhost:10461").parse().unwrap();
+    server_endpoint
+        .config_mut()
+        .extend(
+            [
+                (TLS_ROOT_CA_CERTIFICATE_RAW, CLIENT_CA),
+                (TLS_SERVER_CERTIFICATE_RAW, SERVER_CERT),
+                (TLS_SERVER_PRIVATE_KEY_RAW, SERVER_KEY),
+                (TLS_CLIENT_AUTH, client_auth),
+            ]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+        )
+        .unwrap();
     // Define the reliability and congestion control
     let channel = [
         Channel {
@@ -717,104 +961,64 @@ tOzot3pwe+3SJtpk90xAQrABEO0Zh2unrC8i83ySfg==
         },
     ];
     // Run
-    let endpoints = vec![endpoint];
-    task::block_on(run(&endpoints, &channel, &MSG_SIZE_ALL));
+    let client_endpoints = vec![client_endpoint];
+    let server_endpoints = vec![server_endpoint];
+    task::block_on(run(
+        &client_endpoints,
+        &server_endpoints,
+        &channel,
+        &MSG_SIZE_ALL,
+    ));
 }
 
-#[cfg(feature = "transport_quic")]
+// Constants replicating the alert descriptions thrown by the Rustls library.
+// These alert descriptions are internal of the library and cannot be reached from these tests
+// as to do a proper comparison. For the sake of simplicity we verify these constants are contained
+// in the expected error messages from the tests below.
+//
+// See: https://docs.rs/rustls/latest/src/rustls/msgs/enums.rs.html#128
+#[cfg(all(feature = "transport_tls", target_family = "unix"))]
+const RUSTLS_UNKNOWN_CA_ALERT_DESCRIPTION: &str = "UnknownCA";
+#[cfg(all(feature = "transport_tls", target_family = "unix"))]
+const RUSTLS_CERTIFICATE_REQUIRED_ALERT_DESCRIPTION: &str = "CertificateRequired";
+
+#[cfg(all(feature = "transport_tls", target_family = "unix"))]
 #[test]
-fn transport_unicast_quic_only() {
-    use zenoh_link::quic::config::*;
+fn transport_unicast_tls_only_mutual_no_client_certs_failure() {
+    use std::vec;
+
+    use zenoh_link::tls::config::*;
 
     task::block_on(async {
         zasync_executor_init!();
     });
-    // NOTE: this an auto-generated pair of certificate and key.
-    //       The target domain is localhost, so it has no real
-    //       mapping to any existing domain. The certificate and key
-    //       have been generated using: https://github.com/jsha/minica
-    let key = "-----BEGIN RSA PRIVATE KEY-----
-MIIEowIBAAKCAQEAz105EYUbOdW5uJ8o/TqtxtOtKJL7AQdy5yiXoslosAsulaew
-4JSJetVa6Fa6Bq5BK6fsphGD9bpGGeiBZFBt75JRjOrkj4DwlLGa0CPLTgG5hul4
-Ufe9B7VG3J5P8OwUqIYmPzj8uTbNtkgFRcYumHR28h4GkYdG5Y04AV4vIjgKE47j
-AgV5ACRHkcmGrTzF2HOes2wT73l4yLSkKR4GlIWu5cLRdI8PTUmjMFAh/GIh1ahd
-+VqXz051V3jok0n1klVNjc6DnWuH3j/MSOg/52C3YfcUjCeIJGVfcqDnPTJKSNEF
-yVTYCUjWy+B0B4fMz3MpU17dDWpvS5hfc4VrgQIDAQABAoIBAQCq+i208XBqdnwk
-6y7r5Tcl6qErBE3sIk0upjypX7Ju/TlS8iqYckENQ+AqFGBcY8+ehF5O68BHm2hz
-sk8F/H84+wc8zuzYGjPEFtEUb38RecCUqeqog0Gcmm6sN+ioOLAr6DifBojy2mox
-sx6N0oPW9qigp/s4gTcGzTLxhcwNRHWuoWjQwq6y6qwt2PJXnllii5B5iIJhKAxE
-EOmcVCmFbPavQ1Xr9F5jd5rRc1TYq28hXX8dZN2JhdVUbLlHzaiUfTnA/8yI4lyq
-bEmqu29Oqe+CmDtB6jRnrLiIwyZxzXKuxXaO6NqgxqtaVjLcdISEgZMeHEftuOtf
-C1xxodaVAoGBAOb1Y1SvUGx+VADSt1d30h3bBm1kU/1LhLKZOAQrnFMrEfyOfYbz
-AZ4FJgXE6ZsB1BA7hC0eJDVHz8gTgDJQrOOO8WJWDGRe4TbZkCi5IizYg5UH/6az
-I/WKlfdA4j1tftbQhycHL+9bGzdoRzrwIK489PG4oVAJJCaK2CVtx+l3AoGBAOXY
-75sHOiMaIvDA7qlqFbaBkdi1NzH7bCgy8IntNfLxlOCmGjxeNZzKrkode3JWY9SI
-Mo/nuWj8EZBEHj5omCapzOtkW/Nhnzc4C6U3BCspdrQ4mzbmzEGTdhqvxepa7U7K
-iRcoD1iU7kINCEwg2PsB/BvCSrkn6lpIJlYXlJDHAoGAY7QjgXd9fJi8ou5Uf8oW
-RxU6nRbmuz5Sttc2O3aoMa8yQJkyz4Mwe4s1cuAjCOutJKTM1r1gXC/4HyNsAEyb
-llErG4ySJPJgv1EEzs+9VSbTBw9A6jIDoAiH3QmBoYsXapzy+4I6y1XFVhIKTgND
-2HQwOfm+idKobIsb7GyMFNkCgYBIsixWZBrHL2UNsHfLrXngl2qBmA81B8hVjob1
-mMkPZckopGB353Qdex1U464/o4M/nTQgv7GsuszzTBgktQAqeloNuVg7ygyJcnh8
-cMIoxJx+s8ijvKutse4Q0rdOQCP+X6CsakcwRSp2SZjuOxVljmMmhHUNysocc+Vs
-JVkf0QKBgHiCVLU60EoPketADvhRJTZGAtyCMSb3q57Nb0VIJwxdTB5KShwpul1k
-LPA8Z7Y2i9+IEXcPT0r3M+hTwD7noyHXNlNuzwXot4B8PvbgKkMLyOpcwBjppJd7
-ns4PifoQbhDFnZPSfnrpr+ZXSEzxtiyv7Ql69jznl/vB8b75hBL4
------END RSA PRIVATE KEY-----";
-
-    let cert = "-----BEGIN CERTIFICATE-----
-MIIDLDCCAhSgAwIBAgIIIXlwQVKrtaAwDQYJKoZIhvcNAQELBQAwIDEeMBwGA1UE
-AxMVbWluaWNhIHJvb3QgY2EgMmJiOTlkMB4XDTIxMDIwMjE0NDYzNFoXDTIzMDMw
-NDE0NDYzNFowFDESMBAGA1UEAxMJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
-AAOCAQ8AMIIBCgKCAQEAz105EYUbOdW5uJ8o/TqtxtOtKJL7AQdy5yiXoslosAsu
-laew4JSJetVa6Fa6Bq5BK6fsphGD9bpGGeiBZFBt75JRjOrkj4DwlLGa0CPLTgG5
-hul4Ufe9B7VG3J5P8OwUqIYmPzj8uTbNtkgFRcYumHR28h4GkYdG5Y04AV4vIjgK
-E47jAgV5ACRHkcmGrTzF2HOes2wT73l4yLSkKR4GlIWu5cLRdI8PTUmjMFAh/GIh
-1ahd+VqXz051V3jok0n1klVNjc6DnWuH3j/MSOg/52C3YfcUjCeIJGVfcqDnPTJK
-SNEFyVTYCUjWy+B0B4fMz3MpU17dDWpvS5hfc4VrgQIDAQABo3YwdDAOBgNVHQ8B
-Af8EBAMCBaAwHQYDVR0lBBYwFAYIKwYBBQUHAwEGCCsGAQUFBwMCMAwGA1UdEwEB
-/wQCMAAwHwYDVR0jBBgwFoAULXa6lBiO7OLL5Z6XuF5uF5wR9PQwFAYDVR0RBA0w
-C4IJbG9jYWxob3N0MA0GCSqGSIb3DQEBCwUAA4IBAQBOMkNXfzPEDU475zbiSi3v
-JOhpZLyuoaYY62RzZc9VF8YRybJlWKUWdR3szAiUd1xCJe/beNX7b9lPg6wNadKq
-DGTWFmVxSfpVMO9GQYBXLDcNaAUXzsDLC5sbAFST7jkAJELiRn6KtQYxZ2kEzo7G
-QmzNMfNMc1KeL8Qr4nfEHZx642yscSWj9edGevvx4o48j5KXcVo9+pxQQFao9T2O
-F5QxyGdov+uNATWoYl92Gj8ERi7ovHimU3H7HLIwNPqMJEaX4hH/E/Oz56314E9b
-AXVFFIgCSluyrolaD6CWD9MqOex4YOfJR2bNxI7lFvuK4AwjyUJzT1U1HXib17mM
------END CERTIFICATE-----";
-
-    // Configure the client
-    let ca = "-----BEGIN CERTIFICATE-----
-MIIDSzCCAjOgAwIBAgIIK7mduKtTVxkwDQYJKoZIhvcNAQELBQAwIDEeMBwGA1UE
-AxMVbWluaWNhIHJvb3QgY2EgMmJiOTlkMCAXDTIxMDIwMjEzMTc0NVoYDzIxMjEw
-MjAyMTMxNzQ1WjAgMR4wHAYDVQQDExVtaW5pY2Egcm9vdCBjYSAyYmI5OWQwggEi
-MA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCoBZOxIfVq7LoEpVCMlQzuDnFy
-d+yuk5pFasEQvZ3IvWVta4rPFJ3WGl4UNF6v9bZegNHp+oo70guZ8ps9ez34qrwB
-rrNtZ0YJLDvR0ygloinZZeiclrZcu+x9vRdnyfWqrAulJBMlJIbbHcNx2OCkq7MM
-HdpLJMXxKVbIlQQYGUzRkNTAaK2PiFX5BaqmnZZyo7zNbz7L2asg+0K/FpiS2IRA
-coHPTa9BtsLUJUPRHPr08pgTjM1MQwa+Xxg1+wtMh85xdrqMi6Oe0cxefS+0L04F
-KVfMD3bW8AyuugvcTEpGnea2EvMoPfLWpnPGU3XO8lRZyotZDQzrPvNyYKM3AgMB
-AAGjgYYwgYMwDgYDVR0PAQH/BAQDAgKEMB0GA1UdJQQWMBQGCCsGAQUFBwMBBggr
-BgEFBQcDAjASBgNVHRMBAf8ECDAGAQH/AgEAMB0GA1UdDgQWBBQtdrqUGI7s4svl
-npe4Xm4XnBH09DAfBgNVHSMEGDAWgBQtdrqUGI7s4svlnpe4Xm4XnBH09DANBgkq
-hkiG9w0BAQsFAAOCAQEAJliEt607VUOSDsUeabhG8MIhYDhxe+mjJ4i7N/0xk9JU
-piCUdQr26HyYCzN+bNdjw663rxuVGtTTdHSw2CJHsPSOEDinbYkLMSyDeomsnr0S
-4e0hKUeqXXYg0iC/O2283ZEvvQK5SE+cjm0La0EmqO0mj3Mkc4Fsg8hExYuOur4M
-M0AufDKUhroksKKiCmjsFj1x55VcU45Ag8069lzBk7ntcGQpHUUkwZzvD4FXf8IR
-pVVHiH6WC99p77T9Di99dE5ufjsprfbzkuafgTo2Rz03HgPq64L4po/idP8uBMd6
-tOzot3pwe+3SJtpk90xAQrABEO0Zh2unrC8i83ySfg==
------END CERTIFICATE-----";
 
     // Define the locator
-    let mut endpoint: EndPoint = ("quic/localhost:10452").parse().unwrap();
-    endpoint.extend_configuration(
-        [
-            (TLS_ROOT_CA_CERTIFICATE_RAW, ca),
-            (TLS_SERVER_CERTIFICATE_RAW, cert),
-            (TLS_SERVER_PRIVATE_KEY_RAW, key),
-        ]
-        .iter()
-        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
-    );
+    let mut client_endpoint: EndPoint = ("tls/localhost:10462").parse().unwrap();
+    client_endpoint
+        .config_mut()
+        .extend(
+            [(TLS_ROOT_CA_CERTIFICATE_RAW, SERVER_CA)]
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+        )
+        .unwrap();
 
+    // Define the locator
+    let mut server_endpoint: EndPoint = ("tls/localhost:10462").parse().unwrap();
+    server_endpoint
+        .config_mut()
+        .extend(
+            [
+                (TLS_ROOT_CA_CERTIFICATE_RAW, CLIENT_CA),
+                (TLS_SERVER_CERTIFICATE_RAW, SERVER_CERT),
+                (TLS_SERVER_PRIVATE_KEY_RAW, SERVER_KEY),
+                (TLS_CLIENT_AUTH, "true"),
+            ]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+        )
+        .unwrap();
     // Define the reliability and congestion control
     let channel = [
         Channel {
@@ -835,6 +1039,100 @@ tOzot3pwe+3SJtpk90xAQrABEO0Zh2unrC8i83ySfg==
         },
     ];
     // Run
-    let endpoints = vec![endpoint];
-    task::block_on(run(&endpoints, &channel, &MSG_SIZE_ALL));
+    let client_endpoints = vec![client_endpoint];
+    let server_endpoints = vec![server_endpoint];
+    let result = std::panic::catch_unwind(|| {
+        task::block_on(run(
+            &client_endpoints,
+            &server_endpoints,
+            &channel,
+            &MSG_SIZE_ALL,
+        ))
+    });
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    let error_msg = panic_message::panic_message(&err);
+    assert!(error_msg.contains(RUSTLS_CERTIFICATE_REQUIRED_ALERT_DESCRIPTION));
+}
+
+#[cfg(all(feature = "transport_tls", target_family = "unix"))]
+#[test]
+fn transport_unicast_tls_only_mutual_wrong_client_certs_failure() {
+    use zenoh_link::tls::config::*;
+
+    task::block_on(async {
+        zasync_executor_init!();
+    });
+
+    let client_auth = "true";
+
+    // Define the locator
+    let mut client_endpoint: EndPoint = ("tls/localhost:10463").parse().unwrap();
+    client_endpoint
+        .config_mut()
+        .extend(
+            [
+                (TLS_ROOT_CA_CERTIFICATE_RAW, SERVER_CA),
+                // Using the SERVER_CERT and SERVER_KEY in the client to simulate the case the client has
+                // wrong certificates and keys. The SERVER_CA (cetificate authority) will not recognize
+                // these certificates as it is expecting to receive CLIENT_CERT and CLIENT_KEY from the
+                // client.
+                (TLS_CLIENT_CERTIFICATE_RAW, SERVER_CERT),
+                (TLS_CLIENT_PRIVATE_KEY_RAW, SERVER_KEY),
+                (TLS_CLIENT_AUTH, client_auth),
+            ]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+        )
+        .unwrap();
+
+    // Define the locator
+    let mut server_endpoint: EndPoint = ("tls/localhost:10463").parse().unwrap();
+    server_endpoint
+        .config_mut()
+        .extend(
+            [
+                (TLS_ROOT_CA_CERTIFICATE_RAW, CLIENT_CA),
+                (TLS_SERVER_CERTIFICATE_RAW, SERVER_CERT),
+                (TLS_SERVER_PRIVATE_KEY_RAW, SERVER_KEY),
+                (TLS_CLIENT_AUTH, client_auth),
+            ]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+        )
+        .unwrap();
+    // Define the reliability and congestion control
+    let channel = [
+        Channel {
+            priority: Priority::default(),
+            reliability: Reliability::Reliable,
+        },
+        Channel {
+            priority: Priority::default(),
+            reliability: Reliability::BestEffort,
+        },
+        Channel {
+            priority: Priority::RealTime,
+            reliability: Reliability::Reliable,
+        },
+        Channel {
+            priority: Priority::RealTime,
+            reliability: Reliability::BestEffort,
+        },
+    ];
+    // Run
+    let client_endpoints = vec![client_endpoint];
+    let server_endpoints = vec![server_endpoint];
+    let result = std::panic::catch_unwind(|| {
+        task::block_on(run(
+            &client_endpoints,
+            &server_endpoints,
+            &channel,
+            &MSG_SIZE_ALL,
+        ))
+    });
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    let error_msg = panic_message::panic_message(&err);
+    assert!(error_msg.contains(RUSTLS_UNKNOWN_CA_ALERT_DESCRIPTION));
 }

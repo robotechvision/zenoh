@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -15,28 +15,31 @@ use super::common::{conduit::TransportConduitTx, pipeline::TransmissionPipeline}
 use super::transport::TransportMulticastInner;
 #[cfg(feature = "stats")]
 use super::TransportMulticastStatsAtomic;
-use crate::common::batch::SerializationBatch;
-use crate::common::pipeline::TransmissionPipelineConf;
+use crate::common::batch::WBatch;
+use crate::common::pipeline::{
+    TransmissionPipelineConf, TransmissionPipelineConsumer, TransmissionPipelineProducer,
+};
 use async_std::prelude::FutureExt;
 use async_std::task;
 use async_std::task::JoinHandle;
 use std::convert::TryInto;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use zenoh_buffers::buffer::InsertBuffer;
 use zenoh_buffers::reader::{HasReader, Reader};
-use zenoh_buffers::{ZBuf, ZSlice};
-use zenoh_collections::RecyclingObjectPool;
-use zenoh_core::{bail, Result as ZResult};
-use zenoh_core::{zerror, zlock};
+use zenoh_codec::{RCodec, Zenoh060};
+use zenoh_core::zlock;
 use zenoh_link::{LinkMulticast, Locator};
-use zenoh_protocol::proto::{MessageReader, TransportMessage};
-use zenoh_protocol_core::{ConduitSn, ConduitSnList, PeerId, Priority, WhatAmI, ZInt};
+use zenoh_protocol::{
+    core::{ConduitSn, ConduitSnList, Priority, WhatAmI, ZInt, ZenohId},
+    transport::TransportMessage,
+};
+use zenoh_result::{bail, zerror, ZResult};
+use zenoh_sync::RecyclingObjectPool;
 use zenoh_sync::Signal;
 
 pub(super) struct TransportLinkMulticastConfig {
     pub(super) version: u8,
-    pub(super) pid: PeerId,
+    pub(super) zid: ZenohId,
     pub(super) whatami: WhatAmI,
     pub(super) lease: Duration,
     pub(super) keep_alive: usize,
@@ -50,7 +53,7 @@ pub(super) struct TransportLinkMulticast {
     // The underlying link
     pub(super) link: LinkMulticast,
     // The transmission pipeline
-    pub(super) pipeline: Option<Arc<TransmissionPipeline>>,
+    pub(super) pipeline: Option<TransmissionPipelineProducer>,
     // The transport this link is associated to
     transport: TransportMulticastInner,
     // The signals to stop TX/RX tasks
@@ -97,15 +100,15 @@ impl TransportLinkMulticast {
                 backoff: self.transport.manager.config.queue_backoff,
             };
             // The pipeline
-            let pipeline = Arc::new(TransmissionPipeline::new(tpc, conduit_tx));
-            self.pipeline = Some(pipeline.clone());
+            let (producer, consumer) = TransmissionPipeline::make(tpc, &conduit_tx);
+            self.pipeline = Some(producer);
 
             // Spawn the TX task
             let c_link = self.link.clone();
             let c_transport = self.transport.clone();
             let handle = task::spawn(async move {
                 let res = tx_task(
-                    pipeline.clone(),
+                    consumer,
                     c_link.clone(),
                     config,
                     initial_sns,
@@ -113,7 +116,6 @@ impl TransportLinkMulticast {
                     c_transport.stats.clone(),
                 )
                 .await;
-                pipeline.disable();
                 if let Err(e) = res {
                     log::debug!("{}", e);
                     // Spawn a task to avoid a deadlock waiting for this same task
@@ -126,7 +128,7 @@ impl TransportLinkMulticast {
     }
 
     pub(super) fn stop_tx(&mut self) {
-        if let Some(pipeline) = self.pipeline.take() {
+        if let Some(pipeline) = self.pipeline.as_ref() {
             pipeline.disable();
         }
     }
@@ -188,20 +190,20 @@ impl TransportLinkMulticast {
 /*              TASKS                */
 /*************************************/
 async fn tx_task(
-    pipeline: Arc<TransmissionPipeline>,
+    mut pipeline: TransmissionPipelineConsumer,
     link: LinkMulticast,
     config: TransportLinkMulticastConfig,
-    mut next_sns: Vec<ConduitSn>,
+    mut last_sns: Vec<ConduitSn>,
     #[cfg(feature = "stats")] stats: Arc<TransportMulticastStatsAtomic>,
 ) -> ZResult<()> {
     enum Action {
-        Pull((SerializationBatch, usize)),
+        Pull((WBatch, usize)),
         Join,
         KeepAlive,
         Stop,
     }
 
-    async fn pull(pipeline: &TransmissionPipeline, keep_alive: Duration) -> Action {
+    async fn pull(pipeline: &mut TransmissionPipelineConsumer, keep_alive: Duration) -> Action {
         match pipeline.pull().timeout(keep_alive).await {
             Ok(res) => match res {
                 Some(sb) => Action::Pull(sb),
@@ -222,9 +224,9 @@ async fn tx_task(
     }
 
     let keep_alive = config.join_interval / config.keep_alive as u32;
-    let mut last_join = Instant::now() - config.join_interval;
+    let mut last_join = Instant::now().checked_sub(config.join_interval).unwrap();
     loop {
-        match pull(&pipeline, keep_alive)
+        match pull(&mut pipeline, keep_alive)
             .race(join(last_join, config.join_interval))
             .await
         {
@@ -233,11 +235,11 @@ async fn tx_task(
                 let bytes = batch.as_bytes();
                 link.write_all(bytes).await?;
                 // Keep track of next SNs
-                if let Some(sn) = batch.sn.reliable {
-                    next_sns[priority].reliable = sn.next;
+                if let Some(sn) = batch.latest_sn.reliable {
+                    last_sns[priority].reliable = sn;
                 }
-                if let Some(sn) = batch.sn.best_effort {
-                    next_sns[priority].best_effort = sn.next;
+                if let Some(sn) = batch.latest_sn.best_effort {
+                    last_sns[priority].best_effort = sn;
                 }
                 #[cfg(feature = "stats")]
                 {
@@ -249,25 +251,32 @@ async fn tx_task(
             }
             Action::Join => {
                 let attachment = None;
-                let initial_sns = if next_sns.len() == Priority::NUM {
-                    let tmp: [ConduitSn; Priority::NUM] = next_sns.clone().try_into().unwrap();
+                let next_sns = last_sns
+                    .iter()
+                    .map(|c| ConduitSn {
+                        reliable: (1 + c.reliable) % config.sn_resolution,
+                        best_effort: (1 + c.best_effort) % config.sn_resolution,
+                    })
+                    .collect::<Vec<ConduitSn>>();
+                let next_sns = if next_sns.len() == Priority::NUM {
+                    let tmp: [ConduitSn; Priority::NUM] = next_sns.try_into().unwrap();
                     ConduitSnList::QoS(tmp.into())
                 } else {
                     assert_eq!(next_sns.len(), 1);
                     ConduitSnList::Plain(next_sns[0])
                 };
-                let mut message = TransportMessage::make_join(
+                let message = TransportMessage::make_join(
                     config.version,
                     config.whatami,
-                    config.pid,
+                    config.zid,
                     config.lease,
                     config.sn_resolution,
-                    initial_sns,
+                    next_sns,
                     attachment,
                 );
 
                 #[allow(unused_variables)] // Used when stats feature is enabled
-                let n = link.write_transport_message(&mut message).await?;
+                let n = link.write_transport_message(&message).await?;
                 #[cfg(feature = "stats")]
                 {
                     stats.inc_tx_t_msgs(1);
@@ -277,12 +286,12 @@ async fn tx_task(
                 last_join = Instant::now();
             }
             Action::KeepAlive => {
-                let pid = Some(config.pid);
+                let zid = Some(config.zid);
                 let attachment = None;
-                let mut message = TransportMessage::make_keep_alive(pid, attachment);
+                let message = TransportMessage::make_keep_alive(zid, attachment);
 
                 #[allow(unused_variables)] // Used when stats feature is enabled
-                let n = link.write_transport_message(&mut message).await?;
+                let n = link.write_transport_message(&message).await?;
                 #[cfg(feature = "stats")]
                 {
                     stats.inc_tx_t_msgs(1);
@@ -307,7 +316,7 @@ async fn tx_task(
                     #[cfg(feature = "stats")]
                     {
                         stats.inc_tx_t_msgs(b.stats.t_msgs);
-                        stats.inc_tx_bytes(b.len());
+                        stats.inc_tx_bytes(b.len() as usize);
                     }
                 }
                 break;
@@ -339,8 +348,9 @@ async fn rx_task(
         Ok(Action::Stop)
     }
 
-    // The ZBuf to read a message batch onto
-    let mut zbuf = ZBuf::default();
+    // The codec
+    let codec = Zenoh060::default();
+
     // The pool of buffers
     let mtu = link.get_mtu() as usize;
     let mut n = rx_buffer_size / mtu;
@@ -349,11 +359,8 @@ async fn rx_task(
     }
     let pool = RecyclingObjectPool::new(n, || vec![0_u8; mtu].into_boxed_slice());
     while !signal.is_triggered() {
-        // Clear the zbuf
-        zbuf.clear();
         // Retrieve one buffer
         let mut buffer = pool.try_take().unwrap_or_else(|| pool.alloc());
-
         // Async read from the underlying link
         let action = read(&link, &mut buffer).race(stop(signal.clone())).await?;
         match action {
@@ -366,25 +373,17 @@ async fn rx_task(
                 #[cfg(feature = "stats")]
                 transport.stats.inc_rx_bytes(n);
 
-                // Add the received bytes to the ZBuf for deserialization
-                let zs = ZSlice::make(buffer.into(), 0, n)
-                    .map_err(|_| zerror!("{}: decoding error", link))?;
-                zbuf.append(zs);
-
                 // Deserialize all the messages from the current ZBuf
-                let mut reader = zbuf.reader();
+                let mut reader = buffer[0..n].reader();
                 while reader.can_read() {
-                    match reader.read_transport_message() {
-                        Some(msg) => {
-                            #[cfg(feature = "stats")]
-                            transport.stats.inc_rx_t_msgs(1);
+                    let msg: TransportMessage = codec
+                        .read(&mut reader)
+                        .map_err(|_| zerror!("{}: decoding error", link))?;
 
-                            transport.receive_message(msg, &loc)?
-                        }
-                        None => {
-                            bail!("{}: decoding error", link);
-                        }
-                    }
+                    #[cfg(feature = "stats")]
+                    transport.stats.inc_rx_t_msgs(1);
+
+                    transport.receive_message(msg, &loc)?
                 }
             }
             Action::Stop => break,

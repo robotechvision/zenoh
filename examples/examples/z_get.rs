@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -12,38 +12,48 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use clap::{App, Arg};
-use futures::prelude::*;
+use std::convert::TryFrom;
+use std::time::Duration;
 use zenoh::config::Config;
-use zenoh::prelude::*;
-use zenoh::query::*;
-use zenoh::queryable;
+use zenoh::prelude::r#async::*;
 
 #[async_std::main]
 async fn main() {
     // initiate logging
     env_logger::init();
 
-    let (config, selector, target) = parse_args();
+    let (config, selector, value, target, timeout) = parse_args();
 
     println!("Opening session...");
-    let session = zenoh::open(config).await.unwrap();
+    let session = zenoh::open(config).res().await.unwrap();
 
-    println!("Sending Query '{}'...", selector);
-    let mut replies = session.get(&selector).target(target).await.unwrap();
-    while let Some(reply) = replies.next().await {
-        println!(
-            ">> Received ('{}': '{}')",
-            reply.sample.key_expr.as_str(),
-            String::from_utf8_lossy(&reply.sample.value.payload.contiguous())
-        )
+    println!("Sending Query '{selector}'...");
+    let replies = match value {
+        Some(value) => session.get(&selector).with_value(value),
+        None => session.get(&selector),
+    }
+    .target(target)
+    .timeout(timeout)
+    .res()
+    .await
+    .unwrap();
+    while let Ok(reply) = replies.recv_async().await {
+        match reply.sample {
+            Ok(sample) => println!(
+                ">> Received ('{}': '{}')",
+                sample.key_expr.as_str(),
+                sample.value,
+            ),
+            Err(err) => println!(">> Received (ERROR: '{}')", String::try_from(&err).unwrap()),
+        }
     }
 }
 
-fn parse_args() -> (Config, String, QueryTarget) {
+fn parse_args() -> (Config, String, Option<String>, QueryTarget, Duration) {
     let args = App::new("zenoh query example")
         .arg(
             Arg::from_usage("-m, --mode=[MODE]  'The zenoh session mode (peer by default).")
-                .possible_values(&["peer", "client"]),
+                .possible_values(["peer", "client"]),
         )
         .arg(Arg::from_usage(
             "-e, --connect=[ENDPOINT]...   'Endpoints to connect to.'",
@@ -53,17 +63,19 @@ fn parse_args() -> (Config, String, QueryTarget) {
         ))
         .arg(
             Arg::from_usage("-s, --selector=[SELECTOR] 'The selection of resources to query'")
-                .default_value("/demo/example/**"),
+                .default_value("demo/example/**"),
         )
-        .arg(
-            Arg::from_usage("-k, --kind=[KIND] 'The KIND of queryables to query'")
-                .possible_values(&["ALL_KINDS", "STORAGE", "EVAL"])
-                .default_value("ALL_KINDS"),
-        )
+        .arg(Arg::from_usage(
+            "-v, --value=[VALUE]      'An optional value to put in the query.'",
+        ))
         .arg(
             Arg::from_usage("-t, --target=[TARGET] 'The target queryables of the query'")
-                .possible_values(&["ALL", "BEST_MATCHING", "ALL_COMPLETE", "NONE"])
-                .default_value("ALL"),
+                .possible_values(["BEST_MATCHING", "ALL", "ALL_COMPLETE"])
+                .default_value("BEST_MATCHING"),
+        )
+        .arg(
+            Arg::from_usage("-o, --timeout=[TIME] 'The query timeout in milliseconds'")
+                .default_value("10000"),
         )
         .arg(Arg::from_usage(
             "-c, --config=[FILE]      'A configuration file.'",
@@ -99,18 +111,16 @@ fn parse_args() -> (Config, String, QueryTarget) {
 
     let selector = args.value_of("selector").unwrap().to_string();
 
-    let kind = match args.value_of("kind") {
-        Some("STORAGE") => queryable::STORAGE,
-        Some("EVAL") => queryable::EVAL,
-        _ => queryable::ALL_KINDS,
-    };
+    let value = args.value_of("value").map(ToOwned::to_owned);
 
     let target = match args.value_of("target") {
-        Some("BEST_MATCHING") => Target::BestMatching,
-        Some("ALL_COMPLETE") => Target::AllComplete,
-        Some("NONE") => Target::None,
-        _ => Target::All,
+        Some("BEST_MATCHING") => QueryTarget::BestMatching,
+        Some("ALL") => QueryTarget::All,
+        Some("ALL_COMPLETE") => QueryTarget::AllComplete,
+        _ => QueryTarget::default(),
     };
 
-    (config, selector, QueryTarget { kind, target })
+    let timeout = Duration::from_millis(args.value_of("timeout").unwrap().parse::<u64>().unwrap());
+
+    (config, selector, value, target, timeout)
 }

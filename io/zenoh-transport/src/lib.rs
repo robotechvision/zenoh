@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,23 +11,31 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+
+//! ⚠️ WARNING ⚠️
+//!
+//! This crate is intended for Zenoh's internal use.
+//!
+//! [Click here for Zenoh's documentation](../zenoh/index.html)
 mod common;
 mod manager;
 mod multicast;
 mod primitives;
+#[cfg(feature = "shared-memory")]
+mod shm;
 pub mod unicast;
 
 pub use manager::*;
 pub use multicast::*;
 pub use primitives::*;
+use serde::Serialize;
 use std::any::Any;
 use std::sync::Arc;
 pub use unicast::*;
-use zenoh_core::Result as ZResult;
 use zenoh_link::Link;
-use zenoh_protocol as protocol;
-use zenoh_protocol::core::{PeerId, WhatAmI};
-use zenoh_protocol::proto::ZenohMessage;
+use zenoh_protocol::core::{WhatAmI, ZenohId};
+use zenoh_protocol::zenoh::ZenohMessage;
+use zenoh_result::ZResult;
 
 /*************************************/
 /*            TRANSPORT              */
@@ -93,12 +101,14 @@ impl TransportMulticastEventHandler for DummyTransportMulticastEventHandler {
 /*************************************/
 /*             CALLBACK              */
 /*************************************/
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
+#[serde(rename = "Transport")]
 pub struct TransportPeer {
-    pub pid: PeerId,
+    pub zid: ZenohId,
     pub whatami: WhatAmI,
     pub is_qos: bool,
     pub is_shm: bool,
+    #[serde(skip)]
     pub links: Vec<Link>,
 }
 

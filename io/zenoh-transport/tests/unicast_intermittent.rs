@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -14,17 +14,20 @@
 use async_std::prelude::FutureExt;
 use async_std::task;
 use std::any::Any;
+use std::convert::TryFrom;
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use zenoh_buffers::ZBuf;
 use zenoh_core::zasync_executor_init;
-use zenoh_core::Result as ZResult;
-use zenoh_link::{EndPoint, Link};
-use zenoh_protocol::io::ZBuf;
-use zenoh_protocol::proto::ZenohMessage;
-use zenoh_protocol_core::{Channel, CongestionControl, PeerId, Priority, Reliability, WhatAmI};
+use zenoh_link::Link;
+use zenoh_protocol::{
+    core::{Channel, CongestionControl, EndPoint, Priority, Reliability, WhatAmI, ZenohId},
+    zenoh::ZenohMessage,
+};
+use zenoh_result::ZResult;
 use zenoh_transport::{
     DummyTransportPeerEventHandler, TransportEventHandler, TransportManager, TransportMulticast,
     TransportMulticastEventHandler, TransportPeer, TransportPeerEventHandler, TransportUnicast,
@@ -140,7 +143,7 @@ impl TransportPeerEventHandler for SCClient {
 
 async fn transport_intermittent(endpoint: &EndPoint) {
     /* [ROUTER] */
-    let router_id = PeerId::new(1, [0_u8; PeerId::MAX_SIZE]);
+    let router_id = ZenohId::try_from([1]).unwrap();
 
     let router_handler = Arc::new(SHRouterIntermittent::default());
     // Create the router transport manager
@@ -149,15 +152,15 @@ async fn transport_intermittent(endpoint: &EndPoint) {
         .max_sessions(3);
     let router_manager = TransportManager::builder()
         .whatami(WhatAmI::Router)
-        .pid(router_id)
+        .zid(router_id)
         .unicast(unicast)
         .build(router_handler.clone())
         .unwrap();
 
     /* [CLIENT] */
-    let client01_id = PeerId::new(1, [1_u8; PeerId::MAX_SIZE]);
-    let client02_id = PeerId::new(1, [2_u8; PeerId::MAX_SIZE]);
-    let client03_id = PeerId::new(1, [3_u8; PeerId::MAX_SIZE]);
+    let client01_id = ZenohId::try_from([2]).unwrap();
+    let client02_id = ZenohId::try_from([3]).unwrap();
+    let client03_id = ZenohId::try_from([4]).unwrap();
 
     // Create the transport transport manager for the first client
     let counter = Arc::new(AtomicUsize::new(0));
@@ -166,7 +169,7 @@ async fn transport_intermittent(endpoint: &EndPoint) {
         .max_sessions(3);
     let client01_manager = TransportManager::builder()
         .whatami(WhatAmI::Client)
-        .pid(client01_id)
+        .zid(client01_id)
         .unicast(unicast)
         .build(Arc::new(SHClientStable::new(counter.clone())))
         .unwrap();
@@ -177,7 +180,7 @@ async fn transport_intermittent(endpoint: &EndPoint) {
         .max_sessions(1);
     let client02_manager = TransportManager::builder()
         .whatami(WhatAmI::Client)
-        .pid(client02_id)
+        .zid(client02_id)
         .unicast(unicast)
         .build(Arc::new(SHClientIntermittent::default()))
         .unwrap();
@@ -188,7 +191,7 @@ async fn transport_intermittent(endpoint: &EndPoint) {
         .max_sessions(1);
     let client03_manager = TransportManager::builder()
         .whatami(WhatAmI::Client)
-        .pid(client03_id)
+        .zid(client03_id)
         .unicast(unicast)
         .build(Arc::new(SHClientIntermittent::default()))
         .unwrap();
@@ -198,7 +201,7 @@ async fn transport_intermittent(endpoint: &EndPoint) {
     println!("\nTransport Intermittent [1a1]");
     let _ = ztimeout!(router_manager.add_listener(endpoint.clone())).unwrap();
     let locators = router_manager.get_listeners();
-    println!("Transport Intermittent [1a2]: {:?}", locators);
+    println!("Transport Intermittent [1a2]: {locators:?}");
     assert_eq!(locators.len(), 1);
 
     /* [2] */
@@ -206,7 +209,7 @@ async fn transport_intermittent(endpoint: &EndPoint) {
     let c_ses1 = ztimeout!(client01_manager.open_transport(endpoint.clone())).unwrap();
     assert_eq!(c_ses1.get_links().unwrap().len(), 1);
     assert_eq!(client01_manager.get_transports().len(), 1);
-    assert_eq!(c_ses1.get_pid().unwrap(), router_id);
+    assert_eq!(c_ses1.get_zid().unwrap(), router_id);
 
     /* [3] */
     // Continously open and close transport from client02 and client03 to the router
@@ -221,7 +224,7 @@ async fn transport_intermittent(endpoint: &EndPoint) {
             let c_ses2 = ztimeout!(c_client02_manager.open_transport(c_endpoint.clone())).unwrap();
             assert_eq!(c_ses2.get_links().unwrap().len(), 1);
             assert_eq!(c_client02_manager.get_transports().len(), 1);
-            assert_eq!(c_ses2.get_pid().unwrap(), c_router_id);
+            assert_eq!(c_ses2.get_zid().unwrap(), c_router_id);
 
             task::sleep(SLEEP).await;
 
@@ -245,11 +248,11 @@ async fn transport_intermittent(endpoint: &EndPoint) {
             let c_ses3 = ztimeout!(c_client03_manager.open_transport(c_endpoint.clone())).unwrap();
             assert_eq!(c_ses3.get_links().unwrap().len(), 1);
             assert_eq!(c_client03_manager.get_transports().len(), 1);
-            assert_eq!(c_ses3.get_pid().unwrap(), c_router_id);
+            assert_eq!(c_ses3.get_zid().unwrap(), c_router_id);
 
             task::sleep(SLEEP).await;
 
-            print!("/");
+            print!("");
             std::io::stdout().flush().unwrap();
 
             ztimeout!(c_ses3.close()).unwrap();
@@ -263,7 +266,7 @@ async fn transport_intermittent(endpoint: &EndPoint) {
     let c_router_manager = router_manager.clone();
     ztimeout!(task::spawn_blocking(move || {
         // Create the message to send
-        let key = "/test".into();
+        let key = "test".into();
         let payload = ZBuf::from(vec![0_u8; MSG_SIZE]);
         let channel = Channel {
             priority: Priority::default(),
@@ -292,7 +295,7 @@ async fn transport_intermittent(endpoint: &EndPoint) {
         let mut count = 0;
         while count < MSG_COUNT {
             if count == ticks[0] {
-                println!("\nScheduled {}", count);
+                println!("\nScheduled {count}");
                 ticks.remove(0);
             }
             let transports = c_router_manager.get_transports();
@@ -331,7 +334,7 @@ async fn transport_intermittent(endpoint: &EndPoint) {
             if c == MSG_COUNT {
                 break;
             }
-            println!("Transport Intermittent [4b2]: Received {}/{}", c, MSG_COUNT);
+            println!("Transport Intermittent [4b2]: Received {c}/{MSG_COUNT}");
             task::sleep(SLEEP).await;
         }
     });
@@ -384,25 +387,23 @@ async fn transport_intermittent(endpoint: &EndPoint) {
 #[cfg(feature = "transport_tcp")]
 #[test]
 fn transport_tcp_intermittent() {
-    env_logger::init();
-
+    let _ = env_logger::try_init();
     task::block_on(async {
         zasync_executor_init!();
     });
 
-    let endpoint: EndPoint = "tcp/127.0.0.1:12447".parse().unwrap();
+    let endpoint: EndPoint = format!("tcp/127.0.0.1:{}", 12000).parse().unwrap();
     task::block_on(transport_intermittent(&endpoint));
 }
 
 #[cfg(feature = "transport_ws")]
 #[test]
 fn transport_ws_intermittent() {
-    env_logger::init();
-
+    let _ = env_logger::try_init();
     task::block_on(async {
         zasync_executor_init!();
     });
 
-    let endpoint: EndPoint = "ws/127.0.0.1:12448".parse().unwrap();
+    let endpoint: EndPoint = format!("ws/127.0.0.1:{}", 12010).parse().unwrap();
     task::block_on(transport_intermittent(&endpoint));
 }

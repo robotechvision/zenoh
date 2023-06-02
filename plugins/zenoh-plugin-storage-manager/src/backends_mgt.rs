@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -12,13 +12,20 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use super::storages_mgt::*;
-use async_std::channel::Sender;
-use log::trace;
+use flume::Sender;
 use std::sync::Arc;
-use zenoh::prelude::*;
+use zenoh::prelude::r#async::*;
 use zenoh::Session;
 use zenoh_backend_traits::config::StorageConfig;
-use zenoh_core::Result as ZResult;
+use zenoh_backend_traits::Capability;
+use zenoh_result::ZResult;
+
+pub struct StoreIntercept {
+    pub storage: Box<dyn zenoh_backend_traits::Storage>,
+    pub capability: Capability,
+    pub in_interceptor: Option<Arc<dyn Fn(Sample) -> Sample + Send + Sync>>,
+    pub out_interceptor: Option<Arc<dyn Fn(Sample) -> Sample + Send + Sync>>,
+}
 
 pub(crate) async fn create_and_start_storage(
     admin_key: String,
@@ -28,16 +35,15 @@ pub(crate) async fn create_and_start_storage(
     out_interceptor: Option<Arc<dyn Fn(Sample) -> Sample + Send + Sync>>,
     zenoh: Arc<Session>,
 ) -> ZResult<Sender<StorageMessage>> {
-    trace!("Create storage {}", &admin_key);
-    let key_expr = config.key_expr.clone();
-    let storage = backend.create_storage(config).await?;
-    start_storage(
+    log::trace!("Create storage {}", &admin_key);
+    let capability = backend.get_capability();
+    let storage = backend.create_storage(config.clone()).await?;
+    let store_intercept = StoreIntercept {
         storage,
-        admin_key,
-        key_expr,
+        capability,
         in_interceptor,
         out_interceptor,
-        zenoh,
-    )
-    .await
+    };
+
+    start_storage(store_intercept, config, admin_key, zenoh).await
 }

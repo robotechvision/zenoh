@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,15 +11,20 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::unicast::establishment::authenticator::AuthenticatedPeerLink;
-use crate::unicast::establishment::open::OResult;
-use crate::unicast::establishment::{properties_from_attachment, EstablishmentProperties};
-use crate::TransportManager;
-use std::time::Duration;
-use zenoh_core::{zasyncread, zerror};
+use crate::{
+    unicast::establishment::{
+        authenticator::AuthenticatedPeerLink, open::OResult, EstablishmentProperties,
+    },
+    TransportManager,
+};
+use std::{convert::TryFrom, time::Duration};
+use zenoh_core::zasyncread;
 use zenoh_link::LinkUnicast;
-use zenoh_protocol::core::ZInt;
-use zenoh_protocol::proto::{tmsg, Close, TransportBody};
+use zenoh_protocol::{
+    core::ZInt,
+    transport::{tmsg, Close, TransportBody},
+};
+use zenoh_result::zerror;
 
 pub(super) struct Output {
     pub(super) initial_sn: ZInt,
@@ -33,7 +38,10 @@ pub(super) async fn recv(
     _input: super::open_syn::Output,
 ) -> OResult<Output> {
     // Wait to read an OpenAck
-    let mut messages = link.read_transport_message().await.map_err(|e| (e, None))?;
+    let mut messages = link
+        .read_transport_message()
+        .await
+        .map_err(|e| (e, Some(tmsg::close_reason::INVALID)))?;
     if messages.len() != 1 {
         return Err((
             zerror!(
@@ -50,33 +58,31 @@ pub(super) async fn recv(
     let open_ack = match msg.body {
         TransportBody::OpenAck(open_ack) => open_ack,
         TransportBody::Close(Close { reason, .. }) => {
-            return Err((
-                zerror!(
-                    "Received a close message (reason {}) in response to an OpenSyn on: {:?}",
-                    reason,
-                    link,
-                )
-                .into(),
-                None,
-            ));
+            let e = zerror!(
+                "Received a close message (reason {}) in response to an OpenSyn on: {:?}",
+                tmsg::close_reason_to_str(reason),
+                link,
+            );
+            match reason {
+                tmsg::close_reason::MAX_LINKS => log::debug!("{}", e),
+                _ => log::error!("{}", e),
+            }
+            return Err((e.into(), None));
         }
         _ => {
-            return Err((
-                zerror!(
-                    "Received an invalid message in response to an OpenSyn on {}: {:?}",
-                    link,
-                    msg.body
-                )
-                .into(),
-                Some(tmsg::close_reason::INVALID),
-            ));
+            let e = zerror!(
+                "Received an invalid message in response to an OpenSyn on {}: {:?}",
+                link,
+                msg.body
+            );
+            log::error!("{}", e);
+            return Err((e.into(), Some(tmsg::close_reason::INVALID)));
         }
     };
 
     let mut opean_ack_properties = match msg.attachment.take() {
-        Some(att) => {
-            properties_from_attachment(att).map_err(|e| (e, Some(tmsg::close_reason::INVALID)))?
-        }
+        Some(att) => EstablishmentProperties::try_from(&att)
+            .map_err(|e| (e, Some(tmsg::close_reason::INVALID)))?,
         None => EstablishmentProperties::new(),
     };
     for pa in zasyncread!(manager.state.unicast.peer_authenticator).iter() {

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -21,17 +21,18 @@ pub(crate) mod tx;
 use super::common;
 #[cfg(feature = "stats")]
 use super::common::stats::stats_struct;
-use super::protocol;
-use super::protocol::core::{PeerId, WhatAmI, ZInt};
-use super::protocol::proto::{tmsg, ZenohMessage};
 use super::{TransportPeer, TransportPeerEventHandler};
 pub use manager::*;
 use std::fmt;
 use std::sync::{Arc, Weak};
 use transport::TransportUnicastInner;
-use zenoh_core::zerror;
-use zenoh_core::Result as ZResult;
 use zenoh_link::Link;
+use zenoh_protocol::{
+    core::{WhatAmI, ZInt, ZenohId},
+    transport::tmsg,
+    zenoh::ZenohMessage,
+};
+use zenoh_result::{zerror, ZResult};
 
 /*************************************/
 /*              STATS                */
@@ -79,7 +80,7 @@ stats_struct! {
 /*************************************/
 #[derive(Clone, Copy)]
 pub(crate) struct TransportConfigUnicast {
-    pub(crate) peer: PeerId,
+    pub(crate) peer: ZenohId,
     pub(crate) whatami: WhatAmI,
     pub(crate) sn_resolution: ZInt,
     pub(crate) initial_sn_tx: ZInt,
@@ -101,9 +102,9 @@ impl TransportUnicast {
     }
 
     #[inline(always)]
-    pub fn get_pid(&self) -> ZResult<PeerId> {
+    pub fn get_zid(&self) -> ZResult<ZenohId> {
         let transport = self.get_inner()?;
-        Ok(transport.get_pid())
+        Ok(transport.get_zid())
     }
 
     #[inline(always)]
@@ -139,7 +140,7 @@ impl TransportUnicast {
     pub fn get_peer(&self) -> ZResult<TransportPeer> {
         let transport = self.get_inner()?;
         let tp = TransportPeer {
-            pid: transport.get_pid(),
+            zid: transport.get_zid(),
             whatami: transport.get_whatami(),
             is_qos: transport.is_qos(),
             is_shm: transport.is_shm(),
@@ -222,7 +223,7 @@ impl fmt::Debug for TransportUnicast {
         match self.get_inner() {
             Ok(transport) => f
                 .debug_struct("Transport Unicast")
-                .field("pid", &transport.get_pid())
+                .field("zid", &transport.get_zid())
                 .field("whatami", &transport.get_whatami())
                 .field("sn_resolution", &transport.get_sn_resolution())
                 .field("is_qos", &transport.is_qos())
@@ -230,7 +231,7 @@ impl fmt::Debug for TransportUnicast {
                 .field("links", &transport.get_links())
                 .finish(),
             Err(e) => {
-                write!(f, "{}", e)
+                write!(f, "{e}")
             }
         }
     }

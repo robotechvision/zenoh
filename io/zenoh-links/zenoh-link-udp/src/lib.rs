@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,18 +11,24 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+
+//! ⚠️ WARNING ⚠️
+//!
+//! This crate is intended for Zenoh's internal use.
+//!
+//! [Click here for Zenoh's documentation](../zenoh/index.html)
 mod multicast;
 mod unicast;
-
-use std::{convert::TryFrom, net::SocketAddr};
 
 use async_std::net::ToSocketAddrs;
 use async_trait::async_trait;
 pub use multicast::*;
+use std::net::SocketAddr;
 pub use unicast::*;
-use zenoh_core::{bail, zconfigurable, Result as ZResult};
+use zenoh_core::zconfigurable;
 use zenoh_link_commons::LocatorInspector;
-use zenoh_protocol_core::Locator;
+use zenoh_protocol::core::{endpoint::Address, Locator};
+use zenoh_result::{zerror, ZResult};
 
 // NOTE: In case of using UDP in high-throughput scenarios, it is recommended to set the
 //       UDP buffer size on the host to a reasonable size. Usually, default values for UDP buffers
@@ -69,8 +75,12 @@ impl LocatorInspector for UdpLocatorInspector {
     fn protocol(&self) -> &str {
         UDP_LOCATOR_PREFIX
     }
+
     async fn is_multicast(&self, locator: &Locator) -> ZResult<bool> {
-        Ok(get_udp_addr(locator).await?.ip().is_multicast())
+        let is_multicast = get_udp_addrs(locator.address())
+            .await?
+            .any(|x| x.ip().is_multicast());
+        Ok(is_multicast)
     }
 }
 
@@ -78,16 +88,15 @@ pub mod config {
     pub const UDP_MULTICAST_SRC_IFACE: &str = "src_iface";
 }
 
-pub(crate) async fn get_udp_addr(locator: &Locator) -> ZResult<SocketAddr> {
-    let addr = locator.address();
-    let mut addrs = addr.to_socket_addrs().await?;
-    if let Some(addr) = addrs.next() {
-        Ok(addr)
-    } else {
-        bail!("Couldn't resolve UDP locator address: {}", addr);
-    }
+pub async fn get_udp_addrs(address: Address<'_>) -> ZResult<impl Iterator<Item = SocketAddr>> {
+    let iter = address
+        .as_str()
+        .to_socket_addrs()
+        .await
+        .map_err(|e| zerror!("{}", e))?;
+    Ok(iter)
 }
 
 pub(crate) fn socket_addr_to_udp_locator(addr: &SocketAddr) -> Locator {
-    Locator::try_from(format!("udp/{}", addr)).unwrap()
+    Locator::new(UDP_LOCATOR_PREFIX, addr.to_string(), "").unwrap()
 }

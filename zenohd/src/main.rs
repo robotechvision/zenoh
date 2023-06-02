@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -15,9 +15,11 @@ use async_std::task;
 use clap::{ArgMatches, Command};
 use futures::future;
 use git_version::git_version;
-use zenoh::config::{Config, EndPoint, PluginLoad, ValidatedMap};
-use zenoh::net::runtime::{AdminSpace, Runtime};
+use zenoh::config::{
+    Config, EndPoint, ModeDependentValue, PermissionsConf, PluginLoad, ValidatedMap,
+};
 use zenoh::plugins::PluginsManager;
+use zenoh::runtime::{AdminSpace, Runtime};
 
 const GIT_VERSION: &str = git_version!(prefix = "v", cargo_prefix = "v");
 
@@ -25,7 +27,7 @@ lazy_static::lazy_static!(
     static ref LONG_VERSION: String = format!("{} built with {}", GIT_VERSION, env!("RUSTC_VERSION"));
 );
 
-const DEFAULT_LISTENER: &str = "tcp/0.0.0.0:7447";
+const DEFAULT_LISTENER: &str = "tcp/[::]:7447";
 
 fn main() {
     task::block_on(async {
@@ -43,13 +45,13 @@ fn main() {
             .long_version(LONG_VERSION.as_str()).args(
                 &[
 clap::arg!(-c --config [FILE] "The configuration file. Currently, this file must be a valid JSON5 or YAML file."),
-clap::Arg::new("listen").short('l').long("listen").value_name("ENDPOINT]").help(r"A locator on which this router will listen for incoming sessions.
+clap::Arg::new("listen").short('l').long("listen").value_name("ENDPOINT").help(r"A locator on which this router will listen for incoming sessions.
 Repeat this option to open several listeners.").takes_value(true).multiple_occurrences(true),
 clap::Arg::new("connect").short('e').long("connect").value_name("ENDPOINT").help(r"A peer locator this router will try to connect to.
 Repeat this option to connect to several peers.").takes_value(true).multiple_occurrences(true),
-clap::Arg::new("id").short('i').long("id").value_name("HEX_STRING").help(r"The identifier (as an hexadecimal string, with odd number of chars - e.g.: 0A0B23...) that zenohd must use. If not set, a random UUIDv4 will be used.
+clap::Arg::new("id").short('i').long("id").value_name("HEX_STRING").help(r"The identifier (as an hexadecimal string, with odd number of chars - e.g.: A0B23...) that zenohd must use. If not set, a random unsigned 128bit integer will be used.
 WARNING: this identifier must be unique in the system and must be 16 bytes maximum (32 chars)!").multiple_values(false).multiple_occurrences(false),
-clap::Arg::new("plugin").short('P').long("plugin").value_name("PLUGIN").takes_value(true).multiple_occurrences(true).help(r#"A plugin that MUST be loaded. You can give just the name of the plugin, zenohd will search for a library named 'libzplugin_<name>.so' (exact name depending the OS). Or you can give such a string: "<plugin_name>:<library_path>".
+clap::Arg::new("plugin").short('P').long("plugin").value_name("PLUGIN").takes_value(true).multiple_occurrences(true).help(r#"A plugin that MUST be loaded. You can give just the name of the plugin, zenohd will search for a library named 'libzenoh_plugin_<name>.so' (exact name depending the OS). Or you can give such a string: "<plugin_name>:<library_path>".
 Repeat this option to load several plugins. If loading failed, zenohd will exit."#),
 clap::Arg::new("plugin-search-dir").long("plugin-search-dir").takes_value(true).multiple_occurrences(true).value_name("DIRECTORY").help(r"A directory where to search for plugins libraries to load.
 Repeat this option to specify several search directories."),
@@ -65,15 +67,16 @@ r#"Allows arbitrary configuration changes as column-separated KEY:VALUE pairs, w
   - KEY must be a valid config path.
   - VALUE must be a valid JSON5 string that can be deserialized to the expected type for the KEY field.
 Examples:
---cfg='startup/subscribe:["/demo/**"]'
---cfg='plugins/storage_manager/storages/demo:{key_expr:"/demo/example/**",volume:"memory"}'"#)
+--cfg='startup/subscribe:["demo/**"]'
+--cfg='plugins/storage_manager/storages/demo:{key_expr:"demo/example/**",volume:"memory"}'"#),
+clap::Arg::new("adminspace-permissions").long("adminspace-permissions").value_name("[r|w|rw|none]").help(r"Configure the read and/or write permissions on the admin space. Default is read only."),
                 ]
             );
         let args = app.get_matches();
         let config = config_from_args(&args);
         log::info!("Initial conf: {}", &config);
 
-        let mut plugins = PluginsManager::new(config.libloader());
+        let mut plugins = PluginsManager::dynamic(config.libloader());
         // Static plugins are to be added here, with `.add_static::<PluginType>()`
         for plugin_load in config.plugins().load_requests() {
             let PluginLoad {
@@ -96,7 +99,7 @@ Examples:
         let runtime = match Runtime::new(config).await {
             Ok(runtime) => runtime,
             Err(e) => {
-                println!("{}. Exiting...", e);
+                println!("{e}. Exiting...");
                 std::process::exit(-1);
             }
         };
@@ -143,7 +146,7 @@ fn config_from_args(args: &ArgMatches) -> Config {
     }
     if args.occurrences_of("id") > 0 {
         config
-            .set_id(args.value_of("id").map(|s| s.to_string()))
+            .set_id(args.value_of("id").unwrap().parse().unwrap())
             .unwrap();
     }
     // apply '--rest-http-port' to config only if explicitly set (overwritting config),
@@ -152,7 +155,7 @@ fn config_from_args(args: &ArgMatches) -> Config {
         let value = args.value_of("rest-http-port").unwrap();
         if !value.eq_ignore_ascii_case("none") {
             config
-                .insert_json5("plugins/rest/http_port", &format!(r#""{}""#, value))
+                .insert_json5("plugins/rest/http_port", &format!(r#""{value}""#))
                 .unwrap();
         }
     }
@@ -166,17 +169,14 @@ fn config_from_args(args: &ArgMatches) -> Config {
             match plugin.split_once(':') {
                 Some((name, path)) => {
                     config
-                        .insert_json5(&format!("plugins/{}/__required__", name), "true")
+                        .insert_json5(&format!("plugins/{name}/__required__"), "true")
                         .unwrap();
                     config
-                        .insert_json5(
-                            &format!("plugins/{}/__path__", name),
-                            &format!("\"{}\"", path),
-                        )
+                        .insert_json5(&format!("plugins/{name}/__path__"), &format!("\"{path}\""))
                         .unwrap();
                 }
                 None => config
-                    .insert_json5(&format!("plugins/{}/__required__", plugin), "true")
+                    .insert_json5(&format!("plugins/{plugin}/__required__"), "true")
                     .unwrap(),
             }
         }
@@ -217,17 +217,11 @@ fn config_from_args(args: &ArgMatches) -> Config {
             .endpoints
             .push(DEFAULT_LISTENER.parse().unwrap())
     }
-    match (
-        config.add_timestamp().is_none(),
-        args.is_present("no-timestamp"),
-    ) {
-        (_, true) => {
-            config.set_add_timestamp(Some(false)).unwrap();
-        }
-        (true, false) => {
-            config.set_add_timestamp(Some(true)).unwrap();
-        }
-        (false, false) => {}
+    if args.is_present("no-timestamp") {
+        config
+            .timestamping
+            .set_enabled(Some(ModeDependentValue::Unique(false)))
+            .unwrap();
     };
     match (
         config.scouting.multicast.enabled().is_none(),
@@ -240,6 +234,42 @@ fn config_from_args(args: &ArgMatches) -> Config {
             config.scouting.multicast.set_enabled(Some(true)).unwrap();
         }
         (false, false) => {}
+    };
+    if let Some(permissions) = args.value_of("adminspace-permissions") {
+        match permissions {
+            "r" => config
+                .adminspace
+                .set_permissions(PermissionsConf {
+                    read: true,
+                    write: false,
+                })
+                .unwrap(),
+            "w" => config
+                .adminspace
+                .set_permissions(PermissionsConf {
+                    read: false,
+                    write: true,
+                })
+                .unwrap(),
+            "rw" => config
+                .adminspace
+                .set_permissions(PermissionsConf {
+                    read: true,
+                    write: true,
+                })
+                .unwrap(),
+            "none" => config
+                .adminspace
+                .set_permissions(PermissionsConf {
+                    read: false,
+                    write: false,
+                })
+                .unwrap(),
+            s => panic!(
+                r#"Invalid option: --adminspace-permissions={} - Accepted values: "r", "w", "rw" or "none""#,
+                s
+            ),
+        };
     };
     for json in args.values_of("cfg").unwrap_or_default() {
         if let Some((key, value)) = json.split_once(':') {

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,9 +11,9 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use hmac::{Hmac, Mac, NewMac};
+use hmac::{Hmac, Mac};
 use sha3::{Digest, Sha3_256};
-use zenoh_core::Result as ZResult;
+use zenoh_result::ZResult;
 
 pub fn sign(key: &[u8], data: &[u8]) -> ZResult<Vec<u8>> {
     let mut hmac = Hmac::<Sha3_256>::new_from_slice(key)?;

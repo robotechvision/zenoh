@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -19,11 +19,11 @@ mod open_syn;
 use super::authenticator::AuthenticatedPeerLink;
 use crate::unicast::establishment::{close_link, transport_finalize, InputFinalize, InputInit};
 use crate::{TransportManager, TransportUnicast};
-use zenoh_core::Result as ZResult;
 use zenoh_link::{LinkUnicast, LinkUnicastDirection};
-use zenoh_protocol::proto::tmsg;
+use zenoh_protocol::transport::tmsg;
+use zenoh_result::ZResult;
 
-type OError = (zenoh_core::Error, Option<u8>);
+type OError = (zenoh_result::Error, Option<u8>);
 type OResult<T> = Result<T, OError>;
 
 pub(crate) async fn open_link(
@@ -60,9 +60,9 @@ pub(crate) async fn open_link(
         };
     }
 
-    let pid = output.pid;
+    let zid = output.zid;
     let input = InputInit {
-        pid,
+        zid,
         whatami: output.whatami,
         sn_resolution: output.sn_resolution,
         is_shm: output.is_shm,
@@ -78,7 +78,7 @@ pub(crate) async fn open_link(
                 Err((e, reason)) => {
                     if let Ok(ll) = transport.get_links() {
                         if ll.is_empty() {
-                            let _ = manager.del_transport_unicast(&pid).await;
+                            let _ = manager.del_transport_unicast(&zid).await;
                         }
                     }
                     close_link(link, manager, auth_link, reason).await;
@@ -116,7 +116,7 @@ pub(crate) async fn open_link(
     .sync(output.initial_sn)
     .await;
 
-    log::debug!("New transport link established with {}: {}", pid, link);
+    log::debug!("New transport link established with {}: {}", zid, link);
 
     let output = InputFinalize {
         transport,

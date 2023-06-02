@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,13 +11,19 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+
+//! ⚠️ WARNING ⚠️
+//!
+//! This crate is intended for Zenoh's internal use.
+//!
+//! [Click here for Zenoh's documentation](../zenoh/index.html)
 use async_std::net::ToSocketAddrs;
 use async_trait::async_trait;
 use std::net::SocketAddr;
+use zenoh_core::zconfigurable;
 use zenoh_link_commons::LocatorInspector;
-
-use zenoh_core::{bail, zconfigurable, Result as ZResult};
-use zenoh_protocol_core::Locator;
+use zenoh_protocol::core::{endpoint::Address, Locator};
+use zenoh_result::{zerror, ZResult};
 
 mod unicast;
 pub use unicast::*;
@@ -39,6 +45,7 @@ impl LocatorInspector for TcpLocatorInspector {
     fn protocol(&self) -> &str {
         TCP_LOCATOR_PREFIX
     }
+
     async fn is_multicast(&self, _locator: &Locator) -> ZResult<bool> {
         Ok(false)
     }
@@ -57,10 +64,12 @@ zconfigurable! {
     static ref TCP_ACCEPT_THROTTLE_TIME: u64 = 100_000;
 }
 
-pub async fn get_tcp_addr(address: &Locator) -> ZResult<SocketAddr> {
-    let mut addrs = address.address().to_socket_addrs().await?;
-    match addrs.next() {
-        Some(address) => Ok(address),
-        None => bail!("Couldn't resolve TCP locator address: {}", address),
-    }
+pub async fn get_tcp_addrs(address: Address<'_>) -> ZResult<impl Iterator<Item = SocketAddr>> {
+    let iter = address
+        .as_str()
+        .to_socket_addrs()
+        .await
+        .map_err(|e| zerror!("{}", e))?
+        .filter(|x| !x.ip().is_multicast());
+    Ok(iter)
 }

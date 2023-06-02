@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -22,14 +22,15 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+    use zenoh_buffers::ZBuf;
     use zenoh_cfg_properties::config::*;
     use zenoh_core::zasync_executor_init;
-    use zenoh_core::Result as ZResult;
-    use zenoh_link::EndPoint;
     use zenoh_link::Link;
-    use zenoh_protocol::io::ZBuf;
-    use zenoh_protocol::proto::ZenohMessage;
-    use zenoh_protocol_core::{Channel, CongestionControl, PeerId, Priority, Reliability, WhatAmI};
+    use zenoh_protocol::{
+        core::{Channel, CongestionControl, EndPoint, Priority, Reliability, WhatAmI, ZenohId},
+        zenoh::ZenohMessage,
+    };
+    use zenoh_result::ZResult;
     use zenoh_transport::{
         TransportEventHandler, TransportManager, TransportMulticast,
         TransportMulticastEventHandler, TransportPeer, TransportPeerEventHandler, TransportUnicast,
@@ -136,13 +137,13 @@ mod tests {
         endpoint: &EndPoint,
     ) -> (TransportMulticastPeer, TransportMulticastPeer) {
         // Define peer01 and peer02 IDs
-        let peer01_id = PeerId::new(1, [0_u8; PeerId::MAX_SIZE]);
-        let peer02_id = PeerId::new(1, [1u8; PeerId::MAX_SIZE]);
+        let peer01_id = ZenohId::try_from([1]).unwrap();
+        let peer02_id = ZenohId::try_from([2]).unwrap();
 
         // Create the peer01 transport manager
         let peer01_handler = Arc::new(SHPeer::default());
         let peer01_manager = TransportManager::builder()
-            .pid(peer01_id)
+            .zid(peer01_id)
             .whatami(WhatAmI::Peer)
             .build(peer01_handler.clone())
             .unwrap();
@@ -151,29 +152,29 @@ mod tests {
         let peer02_handler = Arc::new(SHPeer::default());
         let peer02_manager = TransportManager::builder()
             .whatami(WhatAmI::Peer)
-            .pid(peer02_id)
+            .zid(peer02_id)
             .build(peer02_handler.clone())
             .unwrap();
 
         // Create an empty transport with the peer01
         // Open transport -> This should be accepted
-        println!("Opening transport with {}", endpoint);
+        println!("Opening transport with {endpoint}");
         let _ = ztimeout!(peer01_manager.open_transport_multicast(endpoint.clone())).unwrap();
         assert!(peer01_manager
-            .get_transport_multicast(&endpoint.locator)
+            .get_transport_multicast(&endpoint.to_locator())
             .is_some());
         println!("\t{:?}", peer01_manager.get_transports_multicast());
 
-        println!("Opening transport with {}", endpoint);
+        println!("Opening transport with {endpoint}");
         let _ = ztimeout!(peer02_manager.open_transport_multicast(endpoint.clone())).unwrap();
         assert!(peer02_manager
-            .get_transport_multicast(&endpoint.locator)
+            .get_transport_multicast(&endpoint.to_locator())
             .is_some());
         println!("\t{:?}", peer02_manager.get_transports_multicast());
 
         // Wait to for peer 01 and 02 to join each other
         let peer01_transport = peer01_manager
-            .get_transport_multicast(&endpoint.locator)
+            .get_transport_multicast(&endpoint.to_locator())
             .unwrap();
         ztimeout!(async {
             while peer01_transport.get_peers().unwrap().is_empty() {
@@ -182,7 +183,7 @@ mod tests {
         });
 
         let peer02_transport = peer02_manager
-            .get_transport_multicast(&endpoint.locator)
+            .get_transport_multicast(&endpoint.to_locator())
             .unwrap();
         ztimeout!(async {
             while peer02_transport.get_peers().unwrap().is_empty() {
@@ -210,13 +211,13 @@ mod tests {
         endpoint: &EndPoint,
     ) {
         // Close the peer01 transport
-        println!("Closing transport with {}", endpoint);
+        println!("Closing transport with {endpoint}");
         ztimeout!(peer01.transport.close()).unwrap();
         assert!(peer01.manager.get_transports_multicast().is_empty());
         assert!(peer02.transport.get_peers().unwrap().is_empty());
 
         // Close the peer02 transport
-        println!("Closing transport with {}", endpoint);
+        println!("Closing transport with {endpoint}");
         ztimeout!(peer02.transport.close()).unwrap();
         assert!(peer02.manager.get_transports_multicast().is_empty());
 
@@ -231,7 +232,7 @@ mod tests {
         msg_size: usize,
     ) {
         // Create the message to send
-        let key = "/test".into();
+        let key = "test".into();
         let payload = ZBuf::from(vec![0_u8; msg_size]);
         let data_info = None;
         let routing_context = None;
@@ -248,10 +249,7 @@ mod tests {
             attachment,
         );
 
-        println!(
-            "Sending {} messages... {:?} {}",
-            MSG_COUNT, channel, msg_size
-        );
+        println!("Sending {MSG_COUNT} messages... {channel:?} {msg_size}");
         for _ in 0..MSG_COUNT {
             peer01.transport.schedule(message.clone()).unwrap();
         }
@@ -313,7 +311,7 @@ mod tests {
 
         // Define the locator
         let endpoints: Vec<EndPoint> = vec![
-            format!("udp/{}", ZN_MULTICAST_IPV4_ADDRESS_DEFAULT)
+            format!("udp/{ZN_MULTICAST_IPV4_ADDRESS_DEFAULT}")
                 .parse()
                 .unwrap(),
             // Disabling by default because of no IPv6 support

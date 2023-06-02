@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,13 +11,11 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-
 use clap::{App, Arg};
-use futures::prelude::*;
-use zenoh::config::Config;
-use zenoh::prelude::*;
+use std::time::Duration;
+use zenoh::prelude::r#async::*;
 use zenoh::publication::CongestionControl;
-use zenoh::queryable::EVAL;
+use zenoh::{config::Config, key_expr::keyexpr};
 
 const HTML: &str = r#"
 <div id="result"></div>
@@ -38,49 +36,51 @@ async fn main() {
     env_logger::init();
 
     let config = parse_args();
-    let key = "/demo/sse";
+    let key = keyexpr::new("demo/sse").unwrap();
     let value = "Pub from sse server!";
 
     println!("Opening session...");
-    let session = zenoh::open(config).await.unwrap();
+    let session = zenoh::open(config).res().await.unwrap();
 
-    println!("Creating Queryable on '{}'...", key);
-    let mut queryable = session.queryable(key).kind(EVAL).await.unwrap();
+    println!("Declaring Queryable on '{key}'...");
+    let queryable = session.declare_queryable(key).res().await.unwrap();
 
-    async_std::task::spawn(
-        queryable
-            .receiver()
-            .clone()
-            .for_each(move |request| async move {
+    async_std::task::spawn({
+        let receiver = queryable.receiver.clone();
+        async move {
+            while let Ok(request) = receiver.recv_async().await {
                 request
-                    .reply_async(Sample::new(key.to_string(), HTML))
-                    .await;
-            }),
-    );
+                    .reply(Ok(Sample::new(key, HTML)))
+                    .res()
+                    .await
+                    .unwrap();
+            }
+        }
+    });
 
     let event_key = [key, "/event"].concat();
 
-    print!("Declaring key expression '{}'...", event_key);
-    let expr_id = session.declare_expr(&event_key).await.unwrap();
-    println!(" => ExprId {}", expr_id);
-
-    println!("Declaring publication on '{}'...", expr_id);
-    session.declare_publication(expr_id).await.unwrap();
-
-    println!("Putting Data periodically ('{}': '{}')...", expr_id, value);
+    println!("Declaring Publisher on '{event_key}'...");
+    let publisher = session
+        .declare_publisher(&event_key)
+        .congestion_control(CongestionControl::Block)
+        .res()
+        .await
+        .unwrap();
 
     println!(
-        "Data updates are accessible through HTML5 SSE at http://<hostname>:8000{}",
-        key
+        "Putting Data periodically ('{}': '{}')...",
+        &event_key, value
     );
+
+    println!("Data updates are accessible through HTML5 SSE at http://<hostname>:8000/{key}");
     loop {
-        session
-            .put(expr_id, value)
-            .encoding(Encoding::TEXT_PLAIN)
-            .congestion_control(CongestionControl::Block)
+        publisher
+            .put(Value::from(value).encoding(KnownEncoding::TextPlain.into()))
+            .res()
             .await
             .unwrap();
-        async_std::task::sleep(std::time::Duration::new(1, 0)).await;
+        async_std::task::sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -88,7 +88,7 @@ fn parse_args() -> Config {
     let args = App::new("zenoh ssl server example")
         .arg(
             Arg::from_usage("-m, --mode=[MODE] 'The zenoh session mode (peer by default).")
-                .possible_values(&["peer", "client"]),
+                .possible_values(["peer", "client"]),
         )
         .arg(Arg::from_usage(
             "-e, --connect=[ENDPOINT]...  'Endpoints to connect to.'",
@@ -122,7 +122,7 @@ fn parse_args() -> Config {
             .endpoints
             .extend(values.map(|v| v.parse().unwrap()))
     }
-    if let Some(values) = args.values_of("listeners") {
+    if let Some(values) = args.values_of("listen") {
         config
             .listen
             .endpoints

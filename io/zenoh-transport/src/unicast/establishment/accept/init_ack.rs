@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,18 +11,26 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::unicast::establishment::authenticator::AuthenticatedPeerLink;
-use crate::unicast::establishment::{attachment_from_properties, Cookie, EstablishmentProperties};
-use crate::TransportManager;
+use super::{init_syn, AResult};
+use crate::{
+    unicast::establishment::{
+        authenticator::AuthenticatedPeerLink, Cookie, EstablishmentProperties, Zenoh060Cookie,
+    },
+    TransportManager,
+};
 use rand::Rng;
+use std::convert::TryFrom;
+use zenoh_buffers::{writer::HasWriter, ZSlice};
+use zenoh_codec::{WCodec, Zenoh060};
 use zenoh_core::{zasynclock, zasyncread};
 use zenoh_crypto::hmac;
 use zenoh_link::LinkUnicast;
-use zenoh_protocol::core::Property;
-use zenoh_protocol::io::ZSlice;
-use zenoh_protocol::proto::{tmsg, TransportMessage};
-
-use super::{init_syn, AResult};
+use zenoh_protocol::{
+    common::Attachment,
+    core::Property,
+    transport::{tmsg, TransportMessage},
+};
+use zenoh_result::zerror;
 
 // Send an InitAck
 pub(super) struct Output {
@@ -40,7 +48,7 @@ pub(super) async fn send(
 
     // Build the fields for the InitAck message
     let whatami = manager.config.whatami;
-    let apid = manager.config.pid;
+    let azid = manager.config.zid;
     let sn_resolution = if agreed_sn_resolution == input.sn_resolution {
         None
     } else {
@@ -48,12 +56,13 @@ pub(super) async fn send(
     };
 
     // Create the cookie
-    let cookie = Cookie {
+    let mut cookie = Cookie {
         whatami: input.whatami,
-        pid: input.pid,
+        zid: input.zid,
         sn_resolution: agreed_sn_resolution,
         is_qos: input.is_qos,
         nonce: zasynclock!(manager.prng).gen_range(0..agreed_sn_resolution),
+        properties: EstablishmentProperties::new(),
     };
 
     // Build the attachment from the authenticators
@@ -78,7 +87,7 @@ pub(super) async fn send(
                     key: pa.id().into(),
                     value: att,
                 })
-                .map_err(|e| (e, None))?;
+                .map_err(|e| (e, Some(tmsg::close_reason::UNSUPPORTED)))?;
         }
         // Add state in the cookie if avaiable
         if let Some(cke) = cke.take() {
@@ -87,23 +96,41 @@ pub(super) async fn send(
                     key: pa.id().into(),
                     value: cke,
                 })
-                .map_err(|e| (e, None))?;
+                .map_err(|e| (e, Some(tmsg::close_reason::UNSUPPORTED)))?;
         }
     }
-    let attachment = attachment_from_properties(&ps_attachment).ok();
+    cookie.properties = ps_cookie;
 
-    let encrypted = cookie
-        .encrypt(&manager.cipher, &mut *zasynclock!(manager.prng), ps_cookie)
-        .map_err(|e| (e, Some(tmsg::close_reason::INVALID)))?;
+    let attachment: Option<Attachment> = if ps_attachment.is_empty() {
+        None
+    } else {
+        let att = Attachment::try_from(&ps_attachment)
+            .map_err(|e| (e, Some(tmsg::close_reason::INVALID)))?;
+        Some(att)
+    };
+
+    let mut encrypted = vec![];
+    let mut writer = encrypted.writer();
+    let mut codec = Zenoh060Cookie {
+        prng: &mut *zasynclock!(manager.prng),
+        cipher: &manager.cipher,
+        codec: Zenoh060::default(),
+    };
+    codec.write(&mut writer, &cookie).map_err(|_| {
+        (
+            zerror!("Encoding cookie failed").into(),
+            Some(tmsg::close_reason::INVALID),
+        )
+    })?;
 
     // Compute the cookie hash
     let cookie_hash = hmac::digest(&encrypted);
 
     // Send the cookie
     let cookie: ZSlice = encrypted.into();
-    let mut message = TransportMessage::make_init_ack(
+    let message = TransportMessage::make_init_ack(
         whatami,
-        apid,
+        azid,
         sn_resolution,
         input.is_qos,
         cookie,
@@ -112,9 +139,9 @@ pub(super) async fn send(
 
     // Send the message on the link
     let _ = link
-        .write_transport_message(&mut message)
+        .write_transport_message(&message)
         .await
-        .map_err(|e| (e, None))?;
+        .map_err(|e| (e, Some(tmsg::close_reason::GENERIC)))?;
 
     let output = Output { cookie_hash };
     Ok(output)

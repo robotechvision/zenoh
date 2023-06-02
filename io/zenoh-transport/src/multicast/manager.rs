@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -18,11 +18,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use zenoh_config::{Config, ZN_LINK_KEEP_ALIVE_DEFAULT, ZN_LINK_LEASE_DEFAULT};
-use zenoh_core::{bail, Result as ZResult};
-use zenoh_core::{zerror, zlock, zparse};
+use zenoh_core::{zlock, zparse};
 use zenoh_link::*;
-use zenoh_protocol::proto::tmsg;
-use zenoh_protocol_core::locators::LocatorProtocol;
+use zenoh_protocol::{core::endpoint::Protocol, transport::tmsg};
+use zenoh_result::{bail, zerror, ZResult};
 
 pub struct TransportManagerConfigMulticast {
     pub lease: Duration,
@@ -150,23 +149,20 @@ impl TransportManager {
     /*************************************/
     /*            LINK MANAGER           */
     /*************************************/
-    fn new_link_manager_multicast(
-        &self,
-        protocol: &LocatorProtocol,
-    ) -> ZResult<LinkManagerMulticast> {
+    fn new_link_manager_multicast(&self, protocol: &Protocol) -> ZResult<LinkManagerMulticast> {
         let mut w_guard = zlock!(self.state.multicast.protocols);
-        match w_guard.get(protocol) {
+        match w_guard.get(protocol.as_str()) {
             Some(lm) => Ok(lm.clone()),
             None => {
-                let lm = LinkManagerBuilderMulticast::make(protocol)?;
-                w_guard.insert(protocol.to_owned(), lm.clone());
+                let lm = LinkManagerBuilderMulticast::make(protocol.as_str())?;
+                w_guard.insert(protocol.to_string(), lm.clone());
                 Ok(lm)
             }
         }
     }
 
-    fn del_link_manager_multicast(&self, protocol: &LocatorProtocol) -> ZResult<()> {
-        match zlock!(self.state.multicast.protocols).remove(protocol) {
+    fn del_link_manager_multicast(&self, protocol: &Protocol) -> ZResult<()> {
+        match zlock!(self.state.multicast.protocols).remove(protocol.as_str()) {
             Some(_) => Ok(()),
             None => bail!(
                 "Can not delete the link manager for protocol ({}) because it has not been found.",
@@ -184,7 +180,7 @@ impl TransportManager {
     ) -> ZResult<TransportMulticast> {
         if !self
             .locator_inspector
-            .is_multicast(&endpoint.locator)
+            .is_multicast(&endpoint.to_locator())
             .await?
         {
             bail!(
@@ -194,18 +190,10 @@ impl TransportManager {
         }
 
         // Automatically create a new link manager for the protocol if it does not exist
-        let manager = self.new_link_manager_multicast(endpoint.locator.protocol())?;
+        let manager = self.new_link_manager_multicast(&endpoint.protocol())?;
         // Fill and merge the endpoint configuration
-        if let Some(config) = self.config.endpoint.get(endpoint.locator.protocol()) {
-            if endpoint.config.is_some() {
-                endpoint
-                    .config
-                    .as_mut()
-                    .unwrap()
-                    .extend(config.iter().map(|(k, v)| (k.clone(), v.clone())))
-            } else {
-                endpoint.config = Some(config.0.clone().into())
-            }
+        if let Some(config) = self.config.endpoint.get(endpoint.protocol().as_str()) {
+            endpoint.config_mut().extend(config.iter())?;
         }
 
         // Open the link
@@ -232,7 +220,7 @@ impl TransportManager {
 
         let proto = locator.protocol();
         if !guard.iter().any(|(l, _)| l.protocol() == proto) {
-            let _ = self.del_link_manager_multicast(proto);
+            let _ = self.del_link_manager_multicast(&proto);
         }
 
         res.map(|_| ()).ok_or_else(|| {

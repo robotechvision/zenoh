@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,17 +11,24 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+
+//! ⚠️ WARNING ⚠️
+//!
+//! This crate is intended for Zenoh's internal use.
+//!
+//! [Click here for Zenoh's documentation](../zenoh/index.html)
 use async_std::net::ToSocketAddrs;
 use async_trait::async_trait;
 use config::{
     TLS_ROOT_CA_CERTIFICATE_FILE, TLS_SERVER_CERTIFICATE_FILE, TLS_SERVER_PRIVATE_KEY_FILE,
 };
 use std::net::SocketAddr;
-use webpki::{DnsName, DnsNameRef};
 use zenoh_cfg_properties::Properties;
 use zenoh_config::{Config, Locator};
-use zenoh_core::{bail, zconfigurable, zerror, Result as ZResult};
+use zenoh_core::zconfigurable;
 use zenoh_link_commons::{ConfigurationInspector, LocatorInspector};
+use zenoh_protocol::core::endpoint::Address;
+use zenoh_result::{bail, ZResult};
 
 mod unicast;
 pub use unicast::*;
@@ -106,16 +113,9 @@ pub mod config {
     pub const TLS_SERVER_CERTIFICATE_RAW: &str = "tls_server_certificate_raw";
 }
 
-async fn get_quic_addr(address: &Locator) -> ZResult<SocketAddr> {
-    let addr = address.address();
-    match addr.to_socket_addrs().await?.next() {
+async fn get_quic_addr(address: &Address<'_>) -> ZResult<SocketAddr> {
+    match address.as_str().to_socket_addrs().await?.next() {
         Some(addr) => Ok(addr),
-        None => bail!("Couldn't resolve QUIC locator address: {}", addr),
+        None => bail!("Couldn't resolve QUIC locator address: {}", address),
     }
-}
-
-async fn get_quic_dns(address: &Locator) -> ZResult<DnsName> {
-    let addr = address.address().split(':').next().unwrap();
-    let domain = DnsNameRef::try_from_ascii(addr.as_bytes()).map_err(|e| zerror!(e))?;
-    Ok(domain.to_owned())
 }

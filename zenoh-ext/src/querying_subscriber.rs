@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,72 +11,129 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use async_std::pin::Pin;
-use async_std::task::{Context, Poll};
-use futures::stream::Stream;
-use futures::StreamExt;
-use std::future::Future;
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
-use zenoh::prelude::{KeyExpr, Receiver, Sample, Selector, ZFuture};
-use zenoh::query::{QueryConsolidation, QueryTarget, ReplyReceiver, Target};
-use zenoh::queryable::STORAGE;
-use zenoh::subscriber::{Reliability, SampleReceiver, SubMode, Subscriber};
-use zenoh::sync::channel::{RecvError, RecvTimeoutError, TryRecvError};
-use zenoh::sync::zready;
-use zenoh::time::Period;
+use std::collections::{btree_map, BTreeMap, VecDeque};
+use std::convert::TryInto;
+use std::future::Ready;
+use std::mem::swap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use zenoh::handlers::{locked, DefaultHandler};
+use zenoh::prelude::r#async::*;
+use zenoh::query::{QueryConsolidation, QueryTarget, ReplyKeyExpr};
+use zenoh::subscriber::{Reliability, Subscriber};
+use zenoh::time::Timestamp;
 use zenoh::Result as ZResult;
-use zenoh_core::{zread, zwrite};
+use zenoh::SessionRef;
+use zenoh_core::{zlock, AsyncResolve, Resolvable, SyncResolve};
 
-use crate::session_ext::SessionRef;
-
-use super::PublicationCache;
-
-const MERGE_QUEUE_INITIAL_CAPCITY: usize = 32;
-const REPLIES_RECV_QUEUE_INITIAL_CAPCITY: usize = 3;
-
-/// The builder of QueryingSubscriber, allowing to configure it.
-#[derive(Clone)]
-pub struct QueryingSubscriberBuilder<'a, 'b> {
-    session: SessionRef<'a>,
-    sub_key_expr: KeyExpr<'b>,
-    reliability: Reliability,
-    mode: SubMode,
-    period: Option<Period>,
-    query_key_expr: KeyExpr<'b>,
-    query_value_selector: String,
-    query_target: QueryTarget,
-    query_consolidation: QueryConsolidation,
+/// The builder of [`FetchingSubscriber`], allowing to configure it.
+pub struct QueryingSubscriberBuilder<'a, 'b, KeySpace, Handler> {
+    pub(crate) session: SessionRef<'a>,
+    pub(crate) key_expr: ZResult<KeyExpr<'b>>,
+    pub(crate) key_space: KeySpace,
+    pub(crate) reliability: Reliability,
+    pub(crate) origin: Locality,
+    pub(crate) query_selector: Option<ZResult<Selector<'b>>>,
+    pub(crate) query_target: QueryTarget,
+    pub(crate) query_consolidation: QueryConsolidation,
+    pub(crate) query_accept_replies: ReplyKeyExpr,
+    pub(crate) query_timeout: Duration,
+    pub(crate) handler: Handler,
 }
 
-impl<'a, 'b> QueryingSubscriberBuilder<'a, 'b> {
-    pub(crate) fn new(
-        session: SessionRef<'a>,
-        sub_key_expr: KeyExpr<'b>,
-    ) -> QueryingSubscriberBuilder<'a, 'b> {
-        // By default query all matching publication caches and storages
-        let query_target = QueryTarget {
-            kind: PublicationCache::QUERYABLE_KIND | STORAGE,
-            target: Target::All,
-        };
-
-        // By default no query consolidation, to receive more than 1 sample per-resource
-        // (in history of publications is available)
-        let query_consolidation = QueryConsolidation::none();
-
-        QueryingSubscriberBuilder {
+impl<'a, 'b, KeySpace> QueryingSubscriberBuilder<'a, 'b, KeySpace, DefaultHandler> {
+    /// Add callback to [`FetchingSubscriber`].
+    #[inline]
+    pub fn callback<Callback>(
+        self,
+        callback: Callback,
+    ) -> QueryingSubscriberBuilder<'a, 'b, KeySpace, Callback>
+    where
+        Callback: Fn(Sample) + Send + Sync + 'static,
+    {
+        let QueryingSubscriberBuilder {
             session,
-            sub_key_expr: sub_key_expr.clone(),
-            reliability: Reliability::default(),
-            mode: SubMode::default(),
-            period: None,
-            query_key_expr: sub_key_expr,
-            query_value_selector: "".into(),
+            key_expr,
+            key_space,
+            reliability,
+            origin,
+            query_selector,
             query_target,
             query_consolidation,
+            query_accept_replies,
+            query_timeout,
+            handler: _,
+        } = self;
+        QueryingSubscriberBuilder {
+            session,
+            key_expr,
+            key_space,
+            reliability,
+            origin,
+            query_selector,
+            query_target,
+            query_consolidation,
+            query_accept_replies,
+            query_timeout,
+            handler: callback,
         }
     }
 
+    /// Add callback to [`FetchingSubscriber`].
+    ///
+    /// Using this guarantees that your callback will never be called concurrently.
+    /// If your callback is also accepted by the [`callback`](QueryingSubscriberBuilder::callback)
+    /// method, we suggest you use it instead of `callback_mut`
+    #[inline]
+    pub fn callback_mut<CallbackMut>(
+        self,
+        callback: CallbackMut,
+    ) -> QueryingSubscriberBuilder<'a, 'b, KeySpace, impl Fn(Sample) + Send + Sync + 'static>
+    where
+        CallbackMut: FnMut(Sample) + Send + Sync + 'static,
+    {
+        self.callback(locked(callback))
+    }
+
+    /// Use the given handler to recieve Samples.
+    #[inline]
+    pub fn with<Handler>(
+        self,
+        handler: Handler,
+    ) -> QueryingSubscriberBuilder<'a, 'b, KeySpace, Handler>
+    where
+        Handler: zenoh::prelude::IntoCallbackReceiverPair<'static, Sample>,
+    {
+        let QueryingSubscriberBuilder {
+            session,
+            key_expr,
+            key_space,
+            reliability,
+            origin,
+            query_selector,
+            query_target,
+            query_consolidation,
+            query_accept_replies,
+            query_timeout,
+            handler: _,
+        } = self;
+        QueryingSubscriberBuilder {
+            session,
+            key_expr,
+            key_space,
+            reliability,
+            origin,
+            query_selector,
+            query_target,
+            query_consolidation,
+            query_accept_replies,
+            query_timeout,
+            handler,
+        }
+    }
+}
+
+impl<'a, 'b, Handler> QueryingSubscriberBuilder<'a, 'b, crate::UserSpace, Handler> {
     /// Change the subscription reliability.
     #[inline]
     pub fn reliability(mut self, reliability: Reliability) -> Self {
@@ -98,32 +155,12 @@ impl<'a, 'b> QueryingSubscriberBuilder<'a, 'b> {
         self
     }
 
-    /// Change the subscription mode.
+    /// Restrict the matching publications that will be receive by this [`Subscriber`]
+    /// to the ones that have the given [`Locality`](zenoh::prelude::Locality).
+    #[zenoh_macros::unstable]
     #[inline]
-    pub fn mode(mut self, mode: SubMode) -> Self {
-        self.mode = mode;
-        self
-    }
-
-    /// Change the subscription mode to Push.
-    #[inline]
-    pub fn push_mode(mut self) -> Self {
-        self.mode = SubMode::Push;
-        self.period = None;
-        self
-    }
-
-    /// Change the subscription mode to Pull.
-    #[inline]
-    pub fn pull_mode(mut self) -> Self {
-        self.mode = SubMode::Pull;
-        self
-    }
-
-    /// Change the subscription period.
-    #[inline]
-    pub fn period(mut self, period: Option<Period>) -> Self {
-        self.period = period;
+    pub fn allowed_origin(mut self, origin: Locality) -> Self {
+        self.origin = origin;
         self
     }
 
@@ -131,11 +168,10 @@ impl<'a, 'b> QueryingSubscriberBuilder<'a, 'b> {
     #[inline]
     pub fn query_selector<IntoSelector>(mut self, query_selector: IntoSelector) -> Self
     where
-        IntoSelector: Into<Selector<'b>>,
+        IntoSelector: TryInto<Selector<'b>>,
+        <IntoSelector as TryInto<Selector<'b>>>::Error: Into<zenoh_result::Error>,
     {
-        let selector = query_selector.into();
-        self.query_key_expr = selector.key_selector.to_owned();
-        self.query_value_selector = selector.value_selector.to_string();
+        self.query_selector = Some(query_selector.try_into().map_err(Into::into));
         self
     }
 
@@ -148,526 +184,729 @@ impl<'a, 'b> QueryingSubscriberBuilder<'a, 'b> {
 
     /// Change the consolidation mode to be used for queries.
     #[inline]
-    pub fn query_consolidation(mut self, query_consolidation: QueryConsolidation) -> Self {
-        self.query_consolidation = query_consolidation;
+    pub fn query_consolidation<QC: Into<QueryConsolidation>>(
+        mut self,
+        query_consolidation: QC,
+    ) -> Self {
+        self.query_consolidation = query_consolidation.into();
         self
     }
 
-    fn with_static_keys(self) -> QueryingSubscriberBuilder<'a, 'static> {
-        QueryingSubscriberBuilder {
+    /// Change the accepted replies for queries.
+    #[inline]
+    pub fn query_accept_replies(mut self, accept_replies: ReplyKeyExpr) -> Self {
+        self.query_accept_replies = accept_replies;
+        self
+    }
+}
+
+impl<'a, 'b, KeySpace, Handler> QueryingSubscriberBuilder<'a, 'b, KeySpace, Handler> {
+    /// Change the timeout to be used for queries.
+    #[inline]
+    pub fn query_timeout(mut self, query_timeout: Duration) -> Self {
+        self.query_timeout = query_timeout;
+        self
+    }
+}
+
+impl<'a, KeySpace, Handler> Resolvable for QueryingSubscriberBuilder<'a, '_, KeySpace, Handler>
+where
+    Handler: IntoCallbackReceiverPair<'static, Sample>,
+    Handler::Receiver: Send,
+{
+    type To = ZResult<FetchingSubscriber<'a, Handler::Receiver>>;
+}
+
+impl<KeySpace, Handler> SyncResolve for QueryingSubscriberBuilder<'_, '_, KeySpace, Handler>
+where
+    KeySpace: Into<crate::KeySpace> + Clone,
+    Handler: IntoCallbackReceiverPair<'static, Sample> + Send,
+    Handler::Receiver: Send,
+{
+    fn res_sync(self) -> <Self as Resolvable>::To {
+        let session = self.session.clone();
+        let key_expr = self.key_expr?;
+        let key_space = self.key_space.clone().into();
+        let query_selector = match self.query_selector {
+            Some(s) => Some(s?),
+            None => None,
+        };
+        let query_target = self.query_target;
+        let query_consolidation = self.query_consolidation;
+        let query_accept_replies = self.query_accept_replies;
+        let query_timeout = self.query_timeout;
+        FetchingSubscriberBuilder {
             session: self.session,
-            sub_key_expr: self.sub_key_expr.to_owned(),
+            key_expr: Ok(key_expr.clone()),
+            key_space: self.key_space,
             reliability: self.reliability,
-            mode: self.mode,
-            period: self.period,
-            query_key_expr: self.query_key_expr.to_owned(),
-            query_value_selector: "".to_string(),
-            query_target: self.query_target,
-            query_consolidation: self.query_consolidation,
-        }
-    }
-}
-
-impl<'a, 'b> Future for QueryingSubscriberBuilder<'a, 'b> {
-    type Output = ZResult<QueryingSubscriber<'a>>;
-
-    #[inline]
-    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Poll::Ready(QueryingSubscriber::new(
-            Pin::into_inner(self).clone().with_static_keys(),
-        ))
-    }
-}
-
-impl<'a, 'b> ZFuture for QueryingSubscriberBuilder<'a, 'b> {
-    #[inline]
-    fn wait(self) -> ZResult<QueryingSubscriber<'a>> {
-        QueryingSubscriber::new(self.with_static_keys())
-    }
-}
-
-pub struct QueryingSubscriber<'a> {
-    conf: QueryingSubscriberBuilder<'a, 'a>,
-    subscriber: Subscriber<'a>,
-    receiver: QueryingSubscriberReceiver,
-}
-
-impl<'a> QueryingSubscriber<'a> {
-    fn new(conf: QueryingSubscriberBuilder<'a, 'a>) -> ZResult<QueryingSubscriber<'a>> {
-        use zenoh::prelude::EntityFactory;
-        // declare subscriber at first
-        let mut subscriber = match conf.session.clone() {
-            SessionRef::Borrow(session) => session
-                .subscribe(&conf.sub_key_expr)
-                .reliability(conf.reliability)
-                .mode(conf.mode)
-                .period(conf.period)
-                .wait()?,
-            SessionRef::Shared(session) => session
-                .subscribe(&conf.sub_key_expr)
-                .reliability(conf.reliability)
-                .mode(conf.mode)
-                .period(conf.period)
-                .wait()?,
-        };
-
-        let receiver = QueryingSubscriberReceiver::new(subscriber.receiver().clone());
-
-        let mut query_subscriber = QueryingSubscriber {
-            conf,
-            subscriber,
-            receiver,
-        };
-
-        // start query
-        query_subscriber.query().wait()?;
-
-        Ok(query_subscriber)
-    }
-
-    /// Close this QueryingSubscriber
-    #[inline]
-    pub fn close(self) -> impl ZFuture<Output = ZResult<()>> {
-        self.subscriber.close()
-    }
-
-    /// Return the QueryingSubscriberReceiver associated to this subscriber.
-    #[inline]
-    pub fn receiver(&mut self) -> &mut QueryingSubscriberReceiver {
-        &mut self.receiver
-    }
-
-    /// Issue a new query using the configured selector.
-    #[inline]
-    pub fn query(&mut self) -> impl ZFuture<Output = ZResult<()>> {
-        self.query_on_selector(
-            Selector {
-                key_selector: self.conf.query_key_expr.clone(),
-                value_selector: self.conf.query_value_selector.clone().into(),
+            origin: self.origin,
+            fetch: |cb| match key_space {
+                crate::KeySpace::User => match query_selector {
+                    Some(s) => session.get(s),
+                    None => session.get(key_expr),
+                }
+                .callback(cb)
+                .target(query_target)
+                .consolidation(query_consolidation)
+                .accept_replies(query_accept_replies)
+                .timeout(query_timeout)
+                .res_sync(),
+                crate::KeySpace::Liveliness => session
+                    .liveliness()
+                    .get(key_expr)
+                    .callback(cb)
+                    .timeout(query_timeout)
+                    .res_sync(),
             },
-            self.conf.query_target.clone(),
-            self.conf.query_consolidation.clone(),
-        )
+            handler: self.handler,
+            phantom: std::marker::PhantomData,
+        }
+        .res_sync()
+    }
+}
+
+impl<'a, KeySpace, Handler> AsyncResolve for QueryingSubscriberBuilder<'a, '_, KeySpace, Handler>
+where
+    KeySpace: Into<crate::KeySpace> + Clone,
+    Handler: IntoCallbackReceiverPair<'static, Sample> + Send,
+    Handler::Receiver: Send,
+{
+    type Future = Ready<Self::To>;
+
+    fn res_async(self) -> Self::Future {
+        std::future::ready(self.res_sync())
+    }
+}
+
+// Collects samples in their Timestamp order, if any,
+// and ignores repeating samples with duplicate timestamps.
+// Samples without Timestamps are kept in a separate Vector,
+// and are considered as older than any sample with Timestamp.
+struct MergeQueue {
+    untimestamped: VecDeque<Sample>,
+    timstamped: BTreeMap<Timestamp, Sample>,
+}
+
+impl MergeQueue {
+    fn new() -> Self {
+        MergeQueue {
+            untimestamped: VecDeque::new(),
+            timstamped: BTreeMap::new(),
+        }
     }
 
-    /// Issue a new query on the specified selector.
-    #[inline]
-    pub fn query_on<'c, IntoSelector>(
-        &mut self,
-        selector: IntoSelector,
-        target: QueryTarget,
-        consolidation: QueryConsolidation,
-    ) -> impl ZFuture<Output = ZResult<()>>
-    where
-        IntoSelector: Into<Selector<'c>>,
-    {
-        self.query_on_selector(selector.into(), target, consolidation)
+    fn len(&self) -> usize {
+        self.untimestamped.len() + self.timstamped.len()
     }
 
-    #[inline]
-    fn query_on_selector(
-        &mut self,
-        selector: Selector,
-        target: QueryTarget,
-        consolidation: QueryConsolidation,
-    ) -> impl ZFuture<Output = ZResult<()>> {
-        let mut state = zwrite!(self.receiver.state);
-        log::debug!("Start query on {}", selector);
-        match self
-            .conf
-            .session
-            .get(selector)
-            .target(target)
-            .consolidation(consolidation)
-            .wait()
-        {
-            Ok(recv) => {
-                state.replies_recv_queue.push(recv);
-                zready(Ok(()))
-            }
-            Err(err) => zready(Err(err)),
+    fn push(&mut self, sample: Sample) {
+        if let Some(ts) = sample.timestamp {
+            self.timstamped.entry(ts).or_insert(sample);
+        } else {
+            self.untimestamped.push_back(sample);
+        }
+    }
+
+    fn drain(&mut self) -> MergeQueueValues {
+        let mut vec = VecDeque::new();
+        let mut queue = BTreeMap::new();
+        swap(&mut self.untimestamped, &mut vec);
+        swap(&mut self.timstamped, &mut queue);
+        MergeQueueValues {
+            untimestamped: vec,
+            timstamped: queue.into_values(),
         }
     }
 }
 
-impl Stream for QueryingSubscriber<'_> {
+struct MergeQueueValues {
+    untimestamped: VecDeque<Sample>,
+    timstamped: btree_map::IntoValues<Timestamp, Sample>,
+}
+
+impl Iterator for MergeQueueValues {
     type Item = Sample;
-
-    #[inline(always)]
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        self.receiver.poll_next_unpin(cx)
-    }
-}
-
-impl futures::stream::FusedStream for QueryingSubscriber<'_> {
-    #[inline(always)]
-    fn is_terminated(&self) -> bool {
-        self.receiver.is_terminated()
-    }
-}
-
-impl Receiver<Sample> for QueryingSubscriber<'_> {
-    #[inline(always)]
-    fn recv_async(&self) -> flume::r#async::RecvFut<'_, Sample> {
-        self.receiver.recv_async()
-    }
-
-    #[inline(always)]
-    fn recv(&self) -> Result<Sample, RecvError> {
-        self.receiver.recv()
-    }
-
-    #[inline(always)]
-    fn try_recv(&self) -> Result<Sample, TryRecvError> {
-        self.receiver.try_recv()
-    }
-
-    #[inline(always)]
-    fn recv_timeout(&self, timeout: Duration) -> Result<Sample, RecvTimeoutError> {
-        self.receiver.recv_timeout(timeout)
-    }
-
-    #[inline(always)]
-    fn recv_deadline(&self, deadline: Instant) -> Result<Sample, RecvTimeoutError> {
-        self.receiver.recv_deadline(deadline)
-    }
-}
-
-#[derive(Clone)]
-pub struct QueryingSubscriberReceiver {
-    state: Arc<RwLock<InnerState>>,
-}
-
-impl QueryingSubscriberReceiver {
-    fn new(subscriber_recv: SampleReceiver) -> QueryingSubscriberReceiver {
-        QueryingSubscriberReceiver {
-            state: Arc::new(RwLock::new(InnerState {
-                subscriber_recv,
-                replies_recv_queue: Vec::with_capacity(REPLIES_RECV_QUEUE_INITIAL_CAPCITY),
-                merge_queue: Vec::with_capacity(MERGE_QUEUE_INITIAL_CAPCITY),
-            })),
-        }
-    }
-}
-
-impl Stream for QueryingSubscriberReceiver {
-    type Item = Sample;
-
-    #[inline(always)]
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let state = &mut zwrite!(self.state);
-        state.poll_next_unpin(cx)
-    }
-}
-
-impl futures::stream::FusedStream for QueryingSubscriberReceiver {
-    #[inline(always)]
-    fn is_terminated(&self) -> bool {
-        let state = &mut zread!(self.state);
-        state.is_terminated()
-    }
-}
-
-impl Receiver<Sample> for QueryingSubscriberReceiver {
-    fn recv_async(&self) -> flume::r#async::RecvFut<'_, Sample> {
-        // TODO find a better way to forge a RecvFut
-        let (sender, receiver) = flume::bounded(1);
-        let _ = sender.send(self.recv().unwrap());
-        receiver.into_recv_async()
-    }
-
-    fn recv(&self) -> Result<Sample, RecvError> {
-        let state = &mut zwrite!(self.state);
-        state.recv()
-    }
-
-    fn try_recv(&self) -> Result<Sample, TryRecvError> {
-        let state = &mut zwrite!(self.state);
-        state.try_recv()
-    }
-
-    fn recv_timeout(&self, timeout: Duration) -> Result<Sample, RecvTimeoutError> {
-        let state = &mut zwrite!(self.state);
-        state.recv_timeout(timeout)
-    }
-
-    fn recv_deadline(&self, deadline: Instant) -> Result<Sample, RecvTimeoutError> {
-        let state = &mut zwrite!(self.state);
-        state.recv_deadline(deadline)
+    fn next(&mut self) -> Option<Self::Item> {
+        self.untimestamped
+            .pop_front()
+            .or_else(|| self.timstamped.next())
     }
 }
 
 struct InnerState {
-    subscriber_recv: SampleReceiver,
-    replies_recv_queue: Vec<ReplyReceiver>,
-    merge_queue: Vec<Sample>,
+    pending_fetches: u64,
+    merge_queue: MergeQueue,
 }
 
-impl Stream for InnerState {
-    type Item = Sample;
+/// The builder of [`FetchingSubscriber`], allowing to configure it.
+pub struct FetchingSubscriberBuilder<
+    'a,
+    'b,
+    KeySpace,
+    Handler,
+    Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()>,
+    TryIntoSample,
+> where
+    TryIntoSample: TryInto<Sample>,
+    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+{
+    pub(crate) session: SessionRef<'a>,
+    pub(crate) key_expr: ZResult<KeyExpr<'b>>,
+    pub(crate) key_space: KeySpace,
+    pub(crate) reliability: Reliability,
+    pub(crate) origin: Locality,
+    pub(crate) fetch: Fetch,
+    pub(crate) handler: Handler,
+    pub(crate) phantom: std::marker::PhantomData<TryIntoSample>,
+}
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let mself = self.get_mut();
-
-        // if there are queries is in progress
-        if !mself.replies_recv_queue.is_empty() {
-            // get all available replies and add them to merge_queue
-            let mut i = 0;
-            while i < mself.replies_recv_queue.len() {
-                loop {
-                    match mself.replies_recv_queue[i].poll_next_unpin(cx) {
-                        Poll::Ready(Some(mut reply)) => {
-                            log::trace!("Reply received: {}", reply.sample.key_expr);
-                            reply.sample.ensure_timestamp();
-                            mself.merge_queue.push(reply.sample);
-                        }
-                        Poll::Ready(None) => {
-                            // query completed - remove the receiver and break loop
-                            mself.replies_recv_queue.remove(i);
-                            break;
-                        }
-                        Poll::Pending => break, // query still in progress - break loop
-                    }
-                }
-                i += 1;
-            }
-
-            // if the receivers queue is still not empty, it means there are remaining queries
-            if !mself.replies_recv_queue.is_empty() {
-                return Poll::Pending;
-            }
-            log::debug!(
-                "All queries completed, received {} replies",
-                mself.merge_queue.len()
-            );
-
-            // get all publications received during the queries and add them to merge_queue
-            while let Poll::Ready(Some(mut sample)) = mself.subscriber_recv.poll_next_unpin(cx) {
-                log::trace!("Pub received in parallel of query: {}", sample.key_expr);
-                sample.ensure_timestamp();
-                mself.merge_queue.push(sample);
-            }
-
-            // sort and remove duplicates from merge_queue
-            mself
-                .merge_queue
-                .sort_by_key(|sample| *sample.get_timestamp().unwrap());
-            mself
-                .merge_queue
-                .dedup_by_key(|sample| *sample.get_timestamp().unwrap());
-            mself.merge_queue.reverse();
-            log::debug!(
-                "Merged received publications - {} samples to propagate",
-                mself.merge_queue.len()
-            );
-        }
-
-        if mself.merge_queue.is_empty() {
-            log::trace!("poll_next: receiving from subscriber...");
-            // if merge_queue is empty, receive from subscriber
-            mself.subscriber_recv.poll_next_unpin(cx)
-        } else {
-            log::trace!(
-                "poll_next: pop sample from merge_queue (len={})",
-                mself.merge_queue.len()
-            );
-            // otherwise, take from merge_queue
-            Poll::Ready(Some(mself.merge_queue.pop().unwrap()))
+impl<
+        'a,
+        'b,
+        KeySpace,
+        Handler,
+        Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()>,
+        TryIntoSample,
+    > FetchingSubscriberBuilder<'a, 'b, KeySpace, Handler, Fetch, TryIntoSample>
+where
+    TryIntoSample: TryInto<Sample>,
+    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+{
+    fn with_static_keys(
+        self,
+    ) -> FetchingSubscriberBuilder<'a, 'static, KeySpace, Handler, Fetch, TryIntoSample> {
+        FetchingSubscriberBuilder {
+            session: self.session,
+            key_expr: self.key_expr.map(|s| s.into_owned()),
+            key_space: self.key_space,
+            reliability: self.reliability,
+            origin: self.origin,
+            fetch: self.fetch,
+            handler: self.handler,
+            phantom: std::marker::PhantomData,
         }
     }
 }
 
-impl futures::stream::FusedStream for InnerState {
-    #[inline(always)]
-    fn is_terminated(&self) -> bool {
-        self.replies_recv_queue.is_empty() && self.subscriber_recv.is_terminated()
+impl<
+        'a,
+        'b,
+        KeySpace,
+        Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()>,
+        TryIntoSample,
+    > FetchingSubscriberBuilder<'a, 'b, KeySpace, DefaultHandler, Fetch, TryIntoSample>
+where
+    TryIntoSample: TryInto<Sample>,
+    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+{
+    /// Add callback to [`FetchingSubscriber`].
+    #[inline]
+    pub fn callback<Callback>(
+        self,
+        callback: Callback,
+    ) -> FetchingSubscriberBuilder<'a, 'b, KeySpace, Callback, Fetch, TryIntoSample>
+    where
+        Callback: Fn(Sample) + Send + Sync + 'static,
+    {
+        let FetchingSubscriberBuilder {
+            session,
+            key_expr,
+            key_space,
+            reliability,
+            origin,
+            fetch,
+            handler: _,
+            phantom,
+        } = self;
+        FetchingSubscriberBuilder {
+            session,
+            key_expr,
+            key_space,
+            reliability,
+            origin,
+            fetch,
+            handler: callback,
+            phantom,
+        }
+    }
+
+    /// Add callback to [`FetchingSubscriber`].
+    ///
+    /// Using this guarantees that your callback will never be called concurrently.
+    /// If your callback is also accepted by the [`callback`](FetchingSubscriberBuilder::callback)
+    /// method, we suggest you use it instead of `callback_mut`
+    #[inline]
+    pub fn callback_mut<CallbackMut>(
+        self,
+        callback: CallbackMut,
+    ) -> FetchingSubscriberBuilder<
+        'a,
+        'b,
+        KeySpace,
+        impl Fn(Sample) + Send + Sync + 'static,
+        Fetch,
+        TryIntoSample,
+    >
+    where
+        CallbackMut: FnMut(Sample) + Send + Sync + 'static,
+    {
+        self.callback(locked(callback))
+    }
+
+    /// Use the given handler to receive Samples.
+    #[inline]
+    pub fn with<Handler>(
+        self,
+        handler: Handler,
+    ) -> FetchingSubscriberBuilder<'a, 'b, KeySpace, Handler, Fetch, TryIntoSample>
+    where
+        Handler: zenoh::prelude::IntoCallbackReceiverPair<'static, Sample>,
+    {
+        let FetchingSubscriberBuilder {
+            session,
+            key_expr,
+            key_space,
+            reliability,
+            origin,
+            fetch,
+            handler: _,
+            phantom,
+        } = self;
+        FetchingSubscriberBuilder {
+            session,
+            key_expr,
+            key_space,
+            reliability,
+            origin,
+            fetch,
+            handler,
+            phantom,
+        }
     }
 }
 
-impl InnerState {
-    fn recv(&mut self) -> Result<Sample, RecvError> {
-        // if there are queries is in progress
-        if !self.replies_recv_queue.is_empty() {
-            // get all replies and add them to merge_queue
-            for recv in self.replies_recv_queue.drain(..) {
-                while let Ok(mut reply) = recv.recv() {
-                    log::trace!("Reply received: {}", reply.sample.key_expr);
-                    reply.sample.ensure_timestamp();
-                    self.merge_queue.push(reply.sample);
-                }
-            }
-            log::debug!(
-                "All queries completed, received {} replies",
-                self.merge_queue.len()
-            );
-
-            // get all publications received during the query and add them to merge_queue
-            while let Ok(mut sample) = self.subscriber_recv.try_recv() {
-                log::trace!("Pub received in parallel of query: {}", sample.key_expr);
-                sample.ensure_timestamp();
-                self.merge_queue.push(sample);
-            }
-
-            // sort and remove duplicates from merge_queue
-            self.merge_queue
-                .sort_by_key(|sample| *sample.get_timestamp().unwrap());
-            self.merge_queue
-                .dedup_by_key(|sample| *sample.get_timestamp().unwrap());
-            self.merge_queue.reverse();
-            log::debug!(
-                "Merged received publications - {} samples to propagate",
-                self.merge_queue.len()
-            );
-        }
-
-        if self.merge_queue.is_empty() {
-            log::trace!("poll_next: receiving from subscriber...");
-            // if merge_queue is empty, receive from subscriber
-            self.subscriber_recv.recv()
-        } else {
-            log::trace!(
-                "poll_next: pop sample from merge_queue (len={})",
-                self.merge_queue.len()
-            );
-            // otherwise, take from merge_queue
-            Ok(self.merge_queue.pop().unwrap())
-        }
+impl<
+        'a,
+        'b,
+        Handler,
+        Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()>,
+        TryIntoSample,
+    > FetchingSubscriberBuilder<'a, 'b, crate::UserSpace, Handler, Fetch, TryIntoSample>
+where
+    TryIntoSample: TryInto<Sample>,
+    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+{
+    /// Change the subscription reliability.
+    #[inline]
+    pub fn reliability(mut self, reliability: Reliability) -> Self {
+        self.reliability = reliability;
+        self
     }
 
-    fn try_recv(&mut self) -> Result<Sample, TryRecvError> {
-        // if there are queries is in progress
-        if !self.replies_recv_queue.is_empty() {
-            // get all available replies and add them to merge_queue
-            let mut i = 0;
-            while i < self.replies_recv_queue.len() {
-                loop {
-                    match self.replies_recv_queue[i].try_recv() {
-                        Ok(mut reply) => {
-                            log::trace!("Reply received: {}", reply.sample.key_expr);
-                            reply.sample.ensure_timestamp();
-                            self.merge_queue.push(reply.sample);
-                        }
-                        Err(TryRecvError::Disconnected) => {
-                            // query completed - remove the receiver and break loop
-                            self.replies_recv_queue.remove(i);
-                            break;
-                        }
-                        Err(TryRecvError::Empty) => break, // query still in progress - break loop
-                    }
-                }
-                i += 1;
-            }
-
-            // if the receivers queue is still not empty, it means there are remaining queries
-            if !self.replies_recv_queue.is_empty() {
-                return Err(TryRecvError::Empty);
-            }
-            log::debug!(
-                "All queries completed, received {} replies",
-                self.merge_queue.len()
-            );
-
-            // get all publications received during the query and add them to merge_queue
-            while let Ok(mut sample) = self.subscriber_recv.try_recv() {
-                log::trace!("Pub received in parallel of query: {}", sample.key_expr);
-                sample.ensure_timestamp();
-                self.merge_queue.push(sample);
-            }
-
-            // sort and remove duplicates from merge_queue
-            self.merge_queue
-                .sort_by_key(|sample| *sample.get_timestamp().unwrap());
-            self.merge_queue
-                .dedup_by_key(|sample| *sample.get_timestamp().unwrap());
-            self.merge_queue.reverse();
-            log::debug!(
-                "Merged received publications - {} samples to propagate",
-                self.merge_queue.len()
-            );
-        }
-
-        if self.merge_queue.is_empty() {
-            log::trace!("poll_next: receiving from subscriber...");
-            // if merge_queue is empty, receive from subscriber
-            self.subscriber_recv.try_recv()
-        } else {
-            log::trace!(
-                "poll_next: pop sample from merge_queue (len={})",
-                self.merge_queue.len()
-            );
-            // otherwise, take from merge_queue
-            Ok(self.merge_queue.pop().unwrap())
-        }
+    /// Change the subscription reliability to Reliable.
+    #[inline]
+    pub fn reliable(mut self) -> Self {
+        self.reliability = Reliability::Reliable;
+        self
     }
 
-    fn recv_timeout(&mut self, timeout: Duration) -> Result<Sample, RecvTimeoutError> {
-        let deadline = Instant::now() + timeout;
-        self.recv_deadline(deadline)
+    /// Change the subscription reliability to BestEffort.
+    #[inline]
+    pub fn best_effort(mut self) -> Self {
+        self.reliability = Reliability::BestEffort;
+        self
     }
 
-    fn recv_deadline(&mut self, deadline: Instant) -> Result<Sample, RecvTimeoutError> {
-        // if there are queries is in progress
-        if !self.replies_recv_queue.is_empty() {
-            // get all available replies and add them to merge_queue
-            let mut i = 0;
-            while i < self.replies_recv_queue.len() {
-                loop {
-                    match self.replies_recv_queue[i].recv_deadline(deadline) {
-                        Ok(mut reply) => {
-                            log::trace!("Reply received: {}", reply.sample.key_expr);
-                            reply.sample.ensure_timestamp();
-                            self.merge_queue.push(reply.sample);
-                        }
-                        Err(RecvTimeoutError::Disconnected) => {
-                            // query completed - remove the receiver and break loop
-                            self.replies_recv_queue.remove(i);
-                            break;
-                        }
-                        Err(RecvTimeoutError::Timeout) => break, // query still in progress - break loop
-                    }
+    /// Restrict the matching publications that will be receive by this [`FetchingSubscriber`]
+    /// to the ones that have the given [`Locality`](zenoh::prelude::Locality).
+    #[zenoh_macros::unstable]
+    #[inline]
+    pub fn allowed_origin(mut self, origin: Locality) -> Self {
+        self.origin = origin;
+        self
+    }
+}
+
+impl<
+        'a,
+        KeySpace,
+        Handler,
+        Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()>,
+        TryIntoSample,
+    > Resolvable for FetchingSubscriberBuilder<'a, '_, KeySpace, Handler, Fetch, TryIntoSample>
+where
+    Handler: IntoCallbackReceiverPair<'static, Sample>,
+    Handler::Receiver: Send,
+    TryIntoSample: TryInto<Sample>,
+    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+{
+    type To = ZResult<FetchingSubscriber<'a, Handler::Receiver>>;
+}
+
+impl<
+        KeySpace,
+        Handler,
+        Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()> + Send + Sync,
+        TryIntoSample,
+    > SyncResolve for FetchingSubscriberBuilder<'_, '_, KeySpace, Handler, Fetch, TryIntoSample>
+where
+    KeySpace: Into<crate::KeySpace>,
+    Handler: IntoCallbackReceiverPair<'static, Sample> + Send,
+    Handler::Receiver: Send,
+    TryIntoSample: TryInto<Sample> + Send + Sync,
+    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+{
+    fn res_sync(self) -> <Self as Resolvable>::To {
+        FetchingSubscriber::new(self.with_static_keys())
+    }
+}
+
+impl<
+        'a,
+        KeySpace,
+        Handler,
+        Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()> + Send + Sync,
+        TryIntoSample,
+    > AsyncResolve for FetchingSubscriberBuilder<'a, '_, KeySpace, Handler, Fetch, TryIntoSample>
+where
+    KeySpace: Into<crate::KeySpace>,
+    Handler: IntoCallbackReceiverPair<'static, Sample> + Send,
+    Handler::Receiver: Send,
+    TryIntoSample: TryInto<Sample> + Send + Sync,
+    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+{
+    type Future = Ready<Self::To>;
+
+    fn res_async(self) -> Self::Future {
+        std::future::ready(self.res_sync())
+    }
+}
+
+/// A Subscriber that will run the given user defined `fetch` funtion at startup.
+///
+/// The user defined `fetch` funtion should fetch some samples and return them through the callback funtion
+/// (it could typically be a Session::get()). Those samples will be merged with the received publications and made available in the receiver.
+/// Later on, new fetches can be performed again, calling [`FetchingSubscriber::fetch()`](super::FetchingSubscriber::fetch()).
+///
+/// A typical usage of the `FetchingSubscriber` is to retrieve publications that were made in the past, but stored in some zenoh Storage.
+///
+/// # Examples
+/// ```no_run
+/// # async_std::task::block_on(async {
+/// use zenoh::prelude::r#async::*;
+/// use zenoh_ext::*;
+///
+/// let session = zenoh::open(config::peer()).res().await.unwrap();
+/// let subscriber = session
+///     .declare_subscriber("key/expr")
+///     .fetching( |cb| {
+///         use zenoh::prelude::sync::SyncResolve;
+///         session
+///             .get("key/expr")
+///             .callback(cb)
+///             .res_sync()
+///     })
+///     .res()
+///     .await
+///     .unwrap();
+/// while let Ok(sample) = subscriber.recv_async().await {
+///     println!("Received: {:?}", sample);
+/// }
+/// # })
+/// ```
+pub struct FetchingSubscriber<'a, Receiver> {
+    subscriber: Subscriber<'a, ()>,
+    callback: Arc<dyn Fn(Sample) + Send + Sync + 'static>,
+    state: Arc<Mutex<InnerState>>,
+    receiver: Receiver,
+}
+
+impl<Receiver> std::ops::Deref for FetchingSubscriber<'_, Receiver> {
+    type Target = Receiver;
+    fn deref(&self) -> &Self::Target {
+        &self.receiver
+    }
+}
+
+impl<Receiver> std::ops::DerefMut for FetchingSubscriber<'_, Receiver> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.receiver
+    }
+}
+
+impl<'a, Receiver> FetchingSubscriber<'a, Receiver> {
+    fn new<
+        KeySpace,
+        Handler,
+        Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()> + Send + Sync,
+        TryIntoSample,
+    >(
+        conf: FetchingSubscriberBuilder<'a, 'a, KeySpace, Handler, Fetch, TryIntoSample>,
+    ) -> ZResult<Self>
+    where
+        KeySpace: Into<crate::KeySpace>,
+        Handler: IntoCallbackReceiverPair<'static, Sample, Receiver = Receiver> + Send,
+        TryIntoSample: TryInto<Sample> + Send + Sync,
+        <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+    {
+        let state = Arc::new(Mutex::new(InnerState {
+            pending_fetches: 0,
+            merge_queue: MergeQueue::new(),
+        }));
+        let (callback, receiver) = conf.handler.into_cb_receiver_pair();
+
+        let sub_callback = {
+            let state = state.clone();
+            let callback = callback.clone();
+            move |mut s| {
+                let state = &mut zlock!(state);
+                if state.pending_fetches == 0 {
+                    callback(s);
+                } else {
+                    log::trace!("Sample received while fetch in progress: push it to merge_queue");
+                    // ensure the sample has a timestamp, thus it will always be sorted into the MergeQueue
+                    // after any timestamped Sample possibly coming from a fetch reply.
+                    s.ensure_timestamp();
+                    state.merge_queue.push(s);
                 }
-                i += 1;
             }
+        };
 
-            // if the receivers queue is still not empty, it means there are remaining queries, and that a timeout occured
-            if !self.replies_recv_queue.is_empty() {
-                return Err(RecvTimeoutError::Timeout);
-            }
-            log::debug!(
-                "All queries completed, received {} replies",
-                self.merge_queue.len()
-            );
+        let key_expr = conf.key_expr?;
 
-            // get all publications received during the query and add them to merge_queue
-            while let Ok(mut sample) = self.subscriber_recv.try_recv() {
-                log::trace!("Pub received in parallel of query: {}", sample.key_expr);
-                sample.ensure_timestamp();
-                self.merge_queue.push(sample);
-            }
+        // declare subscriber at first
+        let subscriber = match conf.session.clone() {
+            SessionRef::Borrow(session) => match conf.key_space.into() {
+                crate::KeySpace::User => session
+                    .declare_subscriber(&key_expr)
+                    .callback(sub_callback)
+                    .reliability(conf.reliability)
+                    .allowed_origin(conf.origin)
+                    .res_sync()?,
+                crate::KeySpace::Liveliness => session
+                    .liveliness()
+                    .declare_subscriber(&key_expr)
+                    .callback(sub_callback)
+                    .res_sync()?,
+            },
+            SessionRef::Shared(session) => match conf.key_space.into() {
+                crate::KeySpace::User => session
+                    .declare_subscriber(&key_expr)
+                    .callback(sub_callback)
+                    .reliability(conf.reliability)
+                    .allowed_origin(conf.origin)
+                    .res_sync()?,
+                crate::KeySpace::Liveliness => session
+                    .liveliness()
+                    .declare_subscriber(&key_expr)
+                    .callback(sub_callback)
+                    .res_sync()?,
+            },
+        };
 
-            // sort and remove duplicates from merge_queue
-            self.merge_queue
-                .sort_by_key(|sample| *sample.get_timestamp().unwrap());
-            self.merge_queue
-                .dedup_by_key(|sample| *sample.get_timestamp().unwrap());
-            self.merge_queue.reverse();
-            log::debug!(
-                "Merged received publications - {} samples to propagate",
-                self.merge_queue.len()
-            );
+        let mut fetch_subscriber = FetchingSubscriber {
+            subscriber,
+            callback,
+            state,
+            receiver,
+        };
+
+        // start fetch
+        fetch_subscriber.fetch(conf.fetch).res_sync()?;
+
+        Ok(fetch_subscriber)
+    }
+
+    /// Close this FetchingSubscriber
+    #[inline]
+    pub fn close(self) -> impl Resolve<ZResult<()>> + 'a {
+        self.subscriber.undeclare()
+    }
+
+    /// Return the key expression of this FetchingSubscriber
+    #[inline]
+    pub fn key_expr(&self) -> &KeyExpr<'static> {
+        self.subscriber.key_expr()
+    }
+
+    /// Perform an additional `fetch`.
+    ///
+    /// The provided `fetch` funtion should fetch some samples and return them through the callback funtion
+    /// (it could typically be a Session::get()). Those samples will be merged with the received publications and made available in the receiver.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # async_std::task::block_on(async {
+    /// use zenoh::prelude::r#async::*;
+    /// use zenoh_ext::*;
+    ///
+    /// let session = zenoh::open(config::peer()).res().await.unwrap();
+    /// let mut subscriber = session
+    ///     .declare_subscriber("key/expr")
+    ///     .fetching( |cb| {
+    ///         use zenoh::prelude::sync::SyncResolve;
+    ///         session
+    ///             .get("key/expr")
+    ///             .callback(cb)
+    ///             .res_sync()
+    ///     })
+    ///     .res()
+    ///     .await
+    ///     .unwrap();
+    ///
+    /// // perform an additional fetch
+    /// subscriber
+    ///     .fetch( |cb| {
+    ///         use zenoh::prelude::sync::SyncResolve;
+    ///         session
+    ///             .get("key/expr")
+    ///             .callback(cb)
+    ///             .res_sync()
+    ///     })
+    ///     .res()
+    ///     .await
+    ///     .unwrap();
+    /// # })
+    /// ```
+    #[inline]
+    pub fn fetch<
+        Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()> + Send + Sync,
+        TryIntoSample,
+    >(
+        &mut self,
+        fetch: Fetch,
+    ) -> impl Resolve<ZResult<()>>
+    where
+        TryIntoSample: TryInto<Sample> + Send + Sync,
+        <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+    {
+        FetchBuilder {
+            fetch,
+            phantom: std::marker::PhantomData,
+            state: self.state.clone(),
+            callback: self.callback.clone(),
         }
+    }
+}
 
-        if self.merge_queue.is_empty() {
-            log::trace!("poll_next: receiving from subscriber...");
-            // if merge_queue is empty, receive from subscriber
-            self.subscriber_recv.recv_deadline(deadline)
-        } else {
-            log::trace!(
-                "poll_next: pop sample from merge_queue (len={})",
-                self.merge_queue.len()
+struct RepliesHandler {
+    state: Arc<Mutex<InnerState>>,
+    callback: Arc<dyn Fn(Sample) + Send + Sync>,
+}
+
+impl Drop for RepliesHandler {
+    fn drop(&mut self) {
+        let mut state = zlock!(self.state);
+        state.pending_fetches -= 1;
+        log::trace!(
+            "Fetch done - {} fetches still in progress",
+            state.pending_fetches
+        );
+        if state.pending_fetches == 0 {
+            log::debug!(
+                "All fetches done. Replies and live publications merged - {} samples to propagate",
+                state.merge_queue.len()
             );
-            // otherwise, take from merge_queue
-            Ok(self.merge_queue.pop().unwrap())
+            for s in state.merge_queue.drain() {
+                (self.callback)(s);
+            }
         }
+    }
+}
+
+/// The builder returned by [`FetchingSubscriber::fetch`](FetchingSubscriber::fetch).
+///
+/// # Examples
+/// ```no_run
+/// # async_std::task::block_on(async {
+/// # use zenoh::prelude::r#async::*;
+/// # use zenoh_ext::*;
+/// #
+/// # let session = zenoh::open(config::peer()).res().await.unwrap();
+/// # let mut fetching_subscriber = session
+/// #     .declare_subscriber("key/expr")
+/// #     .fetching( |cb| {
+/// #         use zenoh::prelude::sync::SyncResolve;
+/// #         session
+/// #             .get("key/expr")
+/// #             .callback(cb)
+/// #            .res_sync()
+/// #     })
+/// #     .res()
+/// #     .await
+/// #     .unwrap();
+/// #
+/// fetching_subscriber
+///     .fetch( |cb| {
+///         use zenoh::prelude::sync::SyncResolve;
+///         session
+///             .get("key/expr")
+///             .callback(cb)
+///             .res_sync()
+///     })
+///     .res()
+///     .await
+///     .unwrap();
+/// # })
+/// ```
+pub struct FetchBuilder<
+    Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()>,
+    TryIntoSample,
+> where
+    TryIntoSample: TryInto<Sample>,
+    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+{
+    fetch: Fetch,
+    phantom: std::marker::PhantomData<TryIntoSample>,
+    state: Arc<Mutex<InnerState>>,
+    callback: Arc<dyn Fn(Sample) + Send + Sync>,
+}
+
+impl<Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()>, TryIntoSample>
+    Resolvable for FetchBuilder<Fetch, TryIntoSample>
+where
+    TryIntoSample: TryInto<Sample>,
+    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+{
+    type To = ZResult<()>;
+}
+
+impl<Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()>, TryIntoSample>
+    SyncResolve for FetchBuilder<Fetch, TryIntoSample>
+where
+    TryIntoSample: TryInto<Sample>,
+    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+{
+    fn res_sync(self) -> <Self as Resolvable>::To {
+        zlock!(self.state).pending_fetches += 1;
+        // pending fetches will be decremented in RepliesHandler drop()
+        let handler = RepliesHandler {
+            state: self.state,
+            callback: self.callback,
+        };
+
+        log::debug!("Fetch");
+        (self.fetch)(Box::new(move |s: TryIntoSample| match s.try_into() {
+            Ok(s) => {
+                let mut state = zlock!(handler.state);
+                log::trace!("Fetched sample received: push it to merge_queue");
+                state.merge_queue.push(s);
+            }
+            Err(e) => log::debug!("Received error fetching data: {}", e.into()),
+        }))
+    }
+}
+
+impl<Fetch: FnOnce(Box<dyn Fn(TryIntoSample) + Send + Sync>) -> ZResult<()>, TryIntoSample>
+    AsyncResolve for FetchBuilder<Fetch, TryIntoSample>
+where
+    TryIntoSample: TryInto<Sample>,
+    <TryIntoSample as TryInto<Sample>>::Error: Into<zenoh_core::Error>,
+{
+    type Future = Ready<Self::To>;
+
+    fn res_async(self) -> Self::Future {
+        std::future::ready(self.res_sync())
     }
 }

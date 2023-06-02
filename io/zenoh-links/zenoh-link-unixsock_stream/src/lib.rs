@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -12,14 +12,21 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
-use std::path::Path;
-
+//! ⚠️ WARNING ⚠️
+//!
+//! This crate is intended for Zenoh's internal use.
+//!
+//! [Click here for Zenoh's documentation](../zenoh/index.html)
+use async_trait::async_trait;
 use zenoh_core::zconfigurable;
+use zenoh_link_commons::LocatorInspector;
+use zenoh_protocol::core::{endpoint::Address, Locator};
+use zenoh_result::ZResult;
 #[cfg(target_family = "unix")]
 mod unicast;
 #[cfg(target_family = "unix")]
 pub use unicast::*;
-use zenoh_protocol_core::Locator;
+
 // Default MTU (UnixSocketStream PDU) in bytes.
 // NOTE: Since UnixSocketStream is a byte-stream oriented transport, theoretically it has
 //       no limit regarding the MTU. However, given the batching strategy
@@ -38,10 +45,19 @@ zconfigurable! {
     static ref UNIXSOCKSTREAM_ACCEPT_THROTTLE_TIME: u64 = 100_000;
 }
 
-pub fn get_unix_path(locator: &Locator) -> &Path {
-    locator.address().as_ref()
+#[derive(Default, Clone, Copy)]
+pub struct UnixSockStreamLocatorInspector;
+#[async_trait]
+impl LocatorInspector for UnixSockStreamLocatorInspector {
+    fn protocol(&self) -> &str {
+        UNIXSOCKSTREAM_LOCATOR_PREFIX
+    }
+
+    async fn is_multicast(&self, _locator: &Locator) -> ZResult<bool> {
+        Ok(false)
+    }
 }
 
-pub fn get_unix_path_as_string(locator: &Locator) -> String {
-    locator.address().to_owned()
+pub fn get_unix_path_as_string(address: Address<'_>) -> String {
+    address.to_string()
 }

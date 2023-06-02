@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -12,11 +12,11 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use super::defragmentation::DefragBuffer;
-use super::protocol::core::{ConduitSn, Reliability, ZInt};
 use super::seq_num::{SeqNum, SeqNumGenerator};
 use std::sync::{Arc, Mutex};
 use zenoh_core::zlock;
-use zenoh_core::zresult::ZResult;
+use zenoh_protocol::core::{ConduitSn, Reliability, ZInt};
+use zenoh_result::ZResult;
 
 #[derive(Debug)]
 pub(crate) struct TransportChannelTx {

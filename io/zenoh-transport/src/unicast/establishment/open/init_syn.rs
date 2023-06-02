@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -12,13 +12,18 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use super::OResult;
-use crate::unicast::establishment::authenticator::AuthenticatedPeerLink;
-use crate::unicast::establishment::{attachment_from_properties, EstablishmentProperties};
+use crate::unicast::establishment::{
+    authenticator::AuthenticatedPeerLink, EstablishmentProperties,
+};
 use crate::TransportManager;
+use std::convert::TryFrom;
 use zenoh_core::zasyncread;
 use zenoh_link::LinkUnicast;
-use zenoh_protocol::core::Property;
-use zenoh_protocol::proto::TransportMessage;
+use zenoh_protocol::common::Attachment;
+use zenoh_protocol::{
+    core::Property,
+    transport::{tmsg, TransportMessage},
+};
 
 /*************************************/
 /*              OPEN                 */
@@ -33,32 +38,40 @@ pub(super) async fn send(
     let mut ps_attachment = EstablishmentProperties::new();
     for pa in zasyncread!(manager.state.unicast.peer_authenticator).iter() {
         let mut att = pa
-            .get_init_syn_properties(auth_link, &manager.config.pid)
+            .get_init_syn_properties(auth_link, &manager.config.zid)
             .await
-            .map_err(|e| (e, None))?;
+            .map_err(|e| (e, Some(tmsg::close_reason::UNSUPPORTED)))?;
         if let Some(att) = att.take() {
             ps_attachment
                 .insert(Property {
                     key: pa.id().into(),
                     value: att,
                 })
-                .map_err(|e| (e, None))?;
+                .map_err(|e| (e, Some(tmsg::close_reason::UNSUPPORTED)))?;
         }
     }
 
     // Build and send the InitSyn message
-    let mut message = TransportMessage::make_init_syn(
+    let init_syn_attachment = if ps_attachment.is_empty() {
+        None
+    } else {
+        let att = Attachment::try_from(&ps_attachment)
+            .map_err(|e| (e, Some(tmsg::close_reason::INVALID)))?;
+        Some(att)
+    };
+
+    let message = TransportMessage::make_init_syn(
         manager.config.version,
         manager.config.whatami,
-        manager.config.pid,
+        manager.config.zid,
         manager.config.sn_resolution,
         manager.config.unicast.is_qos,
-        attachment_from_properties(&ps_attachment).ok(),
+        init_syn_attachment,
     );
     let _ = link
-        .write_transport_message(&mut message)
+        .write_transport_message(&message)
         .await
-        .map_err(|e| (e, None))?;
+        .map_err(|e| (e, Some(tmsg::close_reason::GENERIC)))?;
 
     let output = Output;
     Ok(output)

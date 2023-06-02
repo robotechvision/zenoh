@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,7 +11,13 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use std::net::SocketAddr;
+
+//! ⚠️ WARNING ⚠️
+//!
+//! This crate is intended for Zenoh's internal use.
+//!
+//! [Click here for Zenoh's documentation](../zenoh/index.html)
+use std::{convert::TryFrom, net::SocketAddr};
 
 use async_std::net::ToSocketAddrs;
 use async_trait::async_trait;
@@ -21,9 +27,10 @@ use config::{
 };
 use zenoh_cfg_properties::Properties;
 use zenoh_config::{Config, ZN_FALSE, ZN_TRUE};
-use zenoh_core::{bail, zconfigurable, Result as ZResult};
+use zenoh_core::zconfigurable;
 use zenoh_link_commons::{ConfigurationInspector, LocatorInspector};
-use zenoh_protocol_core::Locator;
+use zenoh_protocol::core::{endpoint::Address, Locator};
+use zenoh_result::{bail, zerror, ZResult};
 
 mod unicast;
 pub use unicast::*;
@@ -131,21 +138,21 @@ pub mod config {
     pub const TLS_CLIENT_AUTH_DEFAULT: &str = ZN_TLS_CLIENT_AUTH_DEFAULT;
 }
 
-pub async fn get_tls_addr(address: &Locator) -> ZResult<SocketAddr> {
-    let addr = address.address();
-    match addr.to_socket_addrs().await?.next() {
+pub async fn get_tls_addr(address: &Address<'_>) -> ZResult<SocketAddr> {
+    match address.as_str().to_socket_addrs().await?.next() {
         Some(addr) => Ok(addr),
-        None => bail!("Couldn't resolve TLS locator address: {}", addr),
+        None => bail!("Couldn't resolve TLS locator address: {}", address),
     }
 }
 
-pub fn get_tls_host(address: &Locator) -> ZResult<&str> {
-    Ok(address.address().split(':').next().unwrap())
+pub fn get_tls_host<'a>(address: &'a Address<'a>) -> ZResult<&'a str> {
+    address
+        .as_str()
+        .split(':')
+        .next()
+        .ok_or_else(|| zerror!("Invalid TLS address").into())
 }
 
-pub async fn get_tls_dns(address: &Locator) -> ZResult<DNSName> {
-    match DNSNameRef::try_from_ascii_str(get_tls_host(address)?) {
-        Ok(v) => Ok(v.to_owned()),
-        Err(e) => bail!(e),
-    }
+pub fn get_tls_server_name(address: &Address<'_>) -> ZResult<ServerName> {
+    Ok(ServerName::try_from(get_tls_host(address)?).map_err(|e| zerror!(e))?)
 }

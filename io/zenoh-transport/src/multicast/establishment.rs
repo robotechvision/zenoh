@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -15,10 +15,10 @@ use crate::multicast::{TransportMulticast, TransportMulticastConfig, TransportMu
 use crate::TransportManager;
 use rand::Rng;
 use std::sync::Arc;
-use zenoh_core::Result as ZResult;
 use zenoh_core::{zasynclock, zlock};
 use zenoh_link::LinkMulticast;
-use zenoh_protocol_core::{ConduitSn, ConduitSnList, Priority};
+use zenoh_protocol::core::{ConduitSn, ConduitSnList, Priority};
+use zenoh_result::ZResult;
 
 pub(crate) async fn open_link(
     manager: &TransportManager,

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -13,6 +13,7 @@
 //
 use clap::{App, Arg};
 use zenoh::config::Config;
+use zenoh::prelude::r#async::*;
 
 #[async_std::main]
 async fn main() {
@@ -22,19 +23,19 @@ async fn main() {
     let (config, key_expr) = parse_args();
 
     println!("Opening session...");
-    let session = zenoh::open(config).await.unwrap();
+    let session = zenoh::open(config).res().await.unwrap();
 
-    println!("Deleting resources matching '{}'...", key_expr);
-    session.delete(&key_expr).await.unwrap();
+    println!("Deleting resources matching '{key_expr}'...");
+    session.delete(&key_expr).res().await.unwrap();
 
-    session.close().await.unwrap();
+    session.close().res().await.unwrap();
 }
 
 fn parse_args() -> (Config, String) {
     let args = App::new("zenoh delete example")
         .arg(
             Arg::from_usage("-m, --mode=[MODE] 'The zenoh session mode (peer by default).")
-                .possible_values(&["peer", "client"]),
+                .possible_values(["peer", "client"]),
         )
         .arg(Arg::from_usage(
             "-e, --connect=[ENDPOINT]...  'Endpoints to connect to.'",
@@ -49,7 +50,7 @@ fn parse_args() -> (Config, String) {
             Arg::from_usage(
                 "-k, --key=[KEYEXPR]        'The key expression matching resources to delete.'",
             )
-            .default_value("/demo/example/zenoh-rs-put"),
+            .default_value("demo/example/zenoh-rs-put"),
         )
         .arg(Arg::from_usage(
             "--no-multicast-scouting 'Disable the multicast-based scouting mechanism.'",

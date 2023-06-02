@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -12,9 +12,57 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use clap::{App, Arg};
+use std::io::{stdin, Read};
 use std::time::Instant;
 use zenoh::config::Config;
-use zenoh::prelude::*;
+use zenoh::prelude::sync::*;
+
+struct Stats {
+    round_count: usize,
+    round_size: usize,
+    finished_rounds: usize,
+    round_start: Instant,
+    global_start: Option<Instant>,
+}
+impl Stats {
+    fn new(round_size: usize) -> Self {
+        Stats {
+            round_count: 0,
+            round_size,
+            finished_rounds: 0,
+            round_start: Instant::now(),
+            global_start: None,
+        }
+    }
+    fn increment(&mut self) {
+        if self.round_count == 0 {
+            self.round_start = Instant::now();
+            if self.global_start.is_none() {
+                self.global_start = Some(self.round_start)
+            }
+            self.round_count += 1;
+        } else if self.round_count < self.round_size {
+            self.round_count += 1;
+        } else {
+            self.print_round();
+            self.finished_rounds += 1;
+            self.round_count = 0;
+        }
+    }
+    fn print_round(&self) {
+        let elapsed = self.round_start.elapsed().as_secs_f64();
+        let throughtput = (self.round_size as f64) / elapsed;
+        println!("{throughtput} msg/s");
+    }
+}
+impl Drop for Stats {
+    fn drop(&mut self) {
+        let elapsed = self.global_start.unwrap().elapsed().as_secs_f64();
+        let total = self.round_size * self.finished_rounds + self.round_count;
+        let throughtput = total as f64 / elapsed;
+        println!("Received {total} messages over {elapsed:.2}s: {throughtput}msg/s");
+    }
+}
 
 fn main() {
     // initiate logging
@@ -22,49 +70,35 @@ fn main() {
 
     let (config, m, n) = parse_args();
 
-    let session = zenoh::open(config).wait().unwrap();
+    let session = zenoh::open(config).res().unwrap();
 
-    let key_expr = session.declare_expr("/test/thr").wait().unwrap();
+    let key_expr = "test/thr";
 
-    let mut count = 0;
-    let mut start = Instant::now();
-
-    let mut nm = 0;
+    let mut stats = Stats::new(n);
     let _sub = session
-        .subscribe(&key_expr)
-        .callback(move |_sample| {
-            if count == 0 {
-                start = Instant::now();
-                count += 1;
-            } else if count < n {
-                count += 1;
-            } else {
-                print_stats(start, n);
-                nm += 1;
-                count = 0;
-                if nm >= m {
-                    std::process::exit(0)
-                }
+        .declare_subscriber(key_expr)
+        .callback_mut(move |_sample| {
+            stats.increment();
+            if stats.finished_rounds >= m {
+                std::process::exit(0)
             }
         })
-        .wait()
+        .res()
         .unwrap();
 
-    // Stop forever
-    std::thread::park();
-}
-
-fn print_stats(start: Instant, n: usize) {
-    let elapsed = start.elapsed().as_secs_f64();
-    let thpt = (n as f64) / elapsed;
-    println!("{} msg/s", thpt);
+    for byte in stdin().bytes() {
+        match byte {
+            Ok(b'q') => break,
+            _ => std::thread::yield_now(),
+        }
+    }
 }
 
 fn parse_args() -> (Config, usize, usize) {
     let args = App::new("zenoh throughput sub example")
         .arg(
             Arg::from_usage("-m, --mode=[MODE]  'The zenoh session mode (peer by default).")
-                .possible_values(&["peer", "client"]),
+                .possible_values(["peer", "client"]),
         )
         .arg(Arg::from_usage(
             "-e, --connect=[ENDPOINT]...   'Endpoints to connect to.'",

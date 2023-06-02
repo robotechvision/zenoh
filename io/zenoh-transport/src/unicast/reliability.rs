@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -17,7 +17,7 @@ use std::fmt;
 use super::common::seq_num::SeqNum;
 use super::core::ZInt;
 
-use zenoh_core::{ZError, ZErrorKind, ZResult};
+use zenoh_result::{ZError, ZErrorKind, ZResult};
 use zenoh_util::zerror;
 
 pub(super) struct ReliabilityQueue<T> {

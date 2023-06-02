@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,18 +11,18 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+
+//! ⚠️ WARNING ⚠️
+//!
+//! This module is intended for Zenoh's internal use.
+//!
+//! [Click here for Zenoh's documentation](../zenoh/index.html)
 #[doc(hidden)]
-pub use zenoh_link as link;
-#[doc(hidden)]
-pub mod protocol {
-    #[deprecated = "This module is now a separate crate. Use the crate directly for shorter compile-times"]
-    pub use zenoh_protocol::{io, proto};
-    #[deprecated = "This module is now a separate crate. Use the crate directly for shorter compile-times"]
-    pub use zenoh_protocol_core as core;
-}
-#[doc(hidden)]
-pub mod routing;
+pub(crate) mod routing;
 #[doc(hidden)]
 pub mod runtime;
 #[doc(hidden)]
-pub use zenoh_transport as transport;
+pub(crate) use zenoh_transport as transport;
+
+#[cfg(test)]
+pub(crate) mod tests;

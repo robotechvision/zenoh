@@ -1,5 +1,7 @@
+use std::io::{stdin, Read};
+
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -13,7 +15,7 @@
 //
 use clap::{App, Arg};
 use zenoh::config::Config;
-use zenoh::prelude::*;
+use zenoh::prelude::sync::*;
 use zenoh::publication::CongestionControl;
 
 fn main() {
@@ -22,31 +24,33 @@ fn main() {
 
     let config = parse_args();
 
-    let session = zenoh::open(config).wait().unwrap();
+    let session = zenoh::open(config).res().unwrap().into_arc();
 
     // The key expression to read the data from
-    let key_expr_ping = session.declare_expr("/test/ping").wait().unwrap();
+    let key_expr_ping = keyexpr::new("test/ping").unwrap();
 
     // The key expression to echo the data back
-    let key_expr_pong = session.declare_expr("/test/pong").wait().unwrap();
+    let key_expr_pong = keyexpr::new("test/pong").unwrap();
 
-    let sub = session.subscribe(&key_expr_ping).wait().unwrap();
+    let publisher = session
+        .declare_publisher(key_expr_pong)
+        .congestion_control(CongestionControl::Block)
+        .res()
+        .unwrap();
 
-    while let Ok(sample) = sub.recv() {
-        session
-            .put(&key_expr_pong, sample.value)
-            // Make sure to not drop messages because of congestion control
-            .congestion_control(CongestionControl::Block)
-            .wait()
-            .unwrap();
-    }
+    let _sub = session
+        .declare_subscriber(key_expr_ping)
+        .callback(move |sample| publisher.put(sample.value).res().unwrap())
+        .res()
+        .unwrap();
+    for _ in stdin().bytes().take_while(|b| !matches!(b, Ok(b'q'))) {}
 }
 
 fn parse_args() -> Config {
     let args = App::new("zenoh roundtrip pong example")
         .arg(
             Arg::from_usage("-m, --mode=[MODE]  'The zenoh session mode (peer by default).")
-                .possible_values(&["peer", "client"]),
+                .possible_values(["peer", "client"]),
         )
         .arg(Arg::from_usage(
             "-e, --connect=[ENDPOINT]...   'Endpoints to connect to.'",
@@ -56,6 +60,9 @@ fn parse_args() -> Config {
         ))
         .arg(Arg::from_usage(
             "--no-multicast-scouting 'Disable the multicast-based scouting mechanism.'",
+        ))
+        .arg(Arg::from_usage(
+            "-c, --config=[FILE]      'A configuration file.'",
         ))
         .get_matches();
 

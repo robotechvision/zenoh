@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -17,7 +17,8 @@ use futures::prelude::*;
 use futures::select;
 use std::time::Duration;
 use zenoh::config::Config;
-use zenoh::prelude::*;
+use zenoh::prelude::r#async::*;
+use zenoh::query::ReplyKeyExpr;
 use zenoh_ext::*;
 
 #[async_std::main]
@@ -28,41 +29,45 @@ async fn main() {
     let (config, key_expr, query) = parse_args();
 
     println!("Opening session...");
-    let session = zenoh::open(config).await.unwrap();
+    let session = zenoh::open(config).res().await.unwrap();
 
     println!(
-        "Creating a QueryingSubscriber on {} with an initial query on {}",
+        "Declaring QueryingSubscriber on {} with an initial query on {}",
         key_expr,
         query.as_ref().unwrap_or(&key_expr)
     );
-    let mut subscriber = if let Some(selector) = query {
+    let subscriber = if let Some(selector) = query {
         session
-            .subscribe_with_query(key_expr)
+            .declare_subscriber(key_expr)
+            .querying()
             .query_selector(&selector)
+            .query_accept_replies(ReplyKeyExpr::Any)
+            .res()
             .await
             .unwrap()
     } else {
-        session.subscribe_with_query(key_expr).await.unwrap()
+        session
+            .declare_subscriber(key_expr)
+            .querying()
+            .res()
+            .await
+            .unwrap()
     };
 
-    println!("Enter 'd' to issue the query again, or 'q' to quit...");
+    println!("Enter 'q' to quit...");
     let mut stdin = async_std::io::stdin();
     let mut input = [0_u8];
     loop {
         select!(
-            sample = subscriber.next() => {
+            sample = subscriber.recv_async() => {
                 let sample = sample.unwrap();
                 println!(">> [Subscriber] Received {} ('{}': '{}')",
-                    sample.kind, sample.key_expr.as_str(), String::from_utf8_lossy(&sample.value.payload.contiguous()));
+                    sample.kind, sample.key_expr.as_str(), sample.value);
             },
 
             _ = stdin.read_exact(&mut input).fuse() => {
                 match input[0] {
                     b'q' => break,
-                    b'd' => {
-                        println!("Do query again");
-                        subscriber.query().await.unwrap()
-                    }
                     0 => sleep(Duration::from_secs(1)).await,
                     _ => (),
                 }
@@ -75,7 +80,7 @@ fn parse_args() -> (Config, String, Option<String>) {
     let args = App::new("zenoh-ext query sub example")
         .arg(
             Arg::from_usage("-m, --mode=[MODE]  'The zenoh session mode (peer by default).")
-                .possible_values(&["peer", "client"]),
+                .possible_values(["peer", "client"]),
         )
         .arg(Arg::from_usage(
             "-e, --connect=[ENDPOINT]...   'Endpoints to connect to.'",
@@ -85,7 +90,7 @@ fn parse_args() -> (Config, String, Option<String>) {
         ))
         .arg(
             Arg::from_usage("-k, --key=[KEYEXPR] 'The key expression to subscribe onto'")
-                .default_value("/demo/example/**"),
+                .default_value("demo/example/**"),
         )
         .arg(
             Arg::from_usage("-q, --query=[SELECTOR] 'The selector to use for queries (by default it's same than 'selector' option)'"),
@@ -112,7 +117,7 @@ fn parse_args() -> (Config, String, Option<String>) {
             .endpoints
             .extend(values.map(|v| v.parse().unwrap()))
     }
-    if let Some(values) = args.values_of("listeners") {
+    if let Some(values) = args.values_of("listen") {
         config
             .listen
             .endpoints

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -13,26 +13,31 @@
 //
 #[cfg(feature = "shared-memory")]
 mod tests {
-    use async_std::prelude::FutureExt;
-    use async_std::task;
-    use std::any::Any;
-    use std::collections::HashSet;
-    use std::iter::FromIterator;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use std::time::Duration;
-    use zenoh_buffers::SplitBuffer;
+    use async_std::{prelude::FutureExt, task};
+    use std::{
+        any::Any,
+        collections::HashSet,
+        convert::TryFrom,
+        iter::FromIterator,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+    use zenoh_buffers::{SplitBuffer, ZBuf};
     use zenoh_core::zasync_executor_init;
-    use zenoh_core::Result as ZResult;
-    use zenoh_link::{EndPoint, Link};
-    use zenoh_protocol::core::{Channel, PeerId, Priority, Reliability, WhatAmI};
-    use zenoh_protocol::io::{SharedMemoryManager, ZBuf};
-    use zenoh_protocol::proto::{Data, ZenohBody, ZenohMessage};
-    use zenoh_protocol_core::CongestionControl;
-    use zenoh_transport::unicast::establishment::authenticator::SharedMemoryAuthenticator;
+    use zenoh_link::Link;
+    use zenoh_protocol::{
+        core::{Channel, CongestionControl, EndPoint, Priority, Reliability, WhatAmI, ZenohId},
+        zenoh::{Data, ZenohBody, ZenohMessage},
+    };
+    use zenoh_result::ZResult;
+    use zenoh_shm::SharedMemoryManager;
     use zenoh_transport::{
-        TransportEventHandler, TransportManager, TransportMulticast,
-        TransportMulticastEventHandler, TransportPeer, TransportPeerEventHandler, TransportUnicast,
+        unicast::establishment::authenticator::SharedMemoryAuthenticator, TransportEventHandler,
+        TransportManager, TransportMulticast, TransportMulticastEventHandler, TransportPeer,
+        TransportPeerEventHandler, TransportUnicast,
     };
 
     const TIMEOUT: Duration = Duration::from_secs(60);
@@ -115,7 +120,7 @@ mod tests {
             let msg_count = u64::from_le_bytes(count_bytes) as usize;
             let sex_count = self.count.fetch_add(1, Ordering::SeqCst);
             assert_eq!(msg_count, sex_count);
-            print!("{} ", msg_count);
+            print!("{msg_count} ");
 
             Ok(())
         }
@@ -131,13 +136,17 @@ mod tests {
     }
 
     async fn run(endpoint: &EndPoint) {
+        println!("Transport SHM [0a]: {endpoint:?}");
+
         // Define client and router IDs
-        let peer_shm01 = PeerId::new(1, [0_u8; PeerId::MAX_SIZE]);
-        let peer_shm02 = PeerId::new(1, [1_u8; PeerId::MAX_SIZE]);
-        let peer_net01 = PeerId::new(1, [2_u8; PeerId::MAX_SIZE]);
+        let peer_shm01 = ZenohId::try_from([1]).unwrap();
+        let peer_shm02 = ZenohId::try_from([2]).unwrap();
+        let peer_net01 = ZenohId::try_from([3]).unwrap();
 
         // Create the SharedMemoryManager
-        let mut shm01 = SharedMemoryManager::make("peer_shm01".to_string(), 2 * MSG_SIZE).unwrap();
+        let mut shm01 =
+            SharedMemoryManager::make(format!("peer_shm01_{}", endpoint.protocol()), 2 * MSG_SIZE)
+                .unwrap();
 
         // Create a peer manager with shared-memory authenticator enabled
         let peer_shm01_handler = Arc::new(SHPeer::new(false));
@@ -147,7 +156,7 @@ mod tests {
             ]));
         let peer_shm01_manager = TransportManager::builder()
             .whatami(WhatAmI::Peer)
-            .pid(peer_shm01)
+            .zid(peer_shm01)
             .unicast(unicast)
             .build(peer_shm01_handler.clone())
             .unwrap();
@@ -160,7 +169,7 @@ mod tests {
             ]));
         let peer_shm02_manager = TransportManager::builder()
             .whatami(WhatAmI::Peer)
-            .pid(peer_shm02)
+            .zid(peer_shm02)
             .unicast(unicast)
             .build(peer_shm02_handler.clone())
             .unwrap();
@@ -169,12 +178,12 @@ mod tests {
         let peer_net01_handler = Arc::new(SHPeer::new(false));
         let peer_net01_manager = TransportManager::builder()
             .whatami(WhatAmI::Peer)
-            .pid(peer_net01)
+            .zid(peer_net01)
             .build(peer_net01_handler.clone())
             .unwrap();
 
         // Create the listener on the peer
-        println!("\nTransport SHM [1a]");
+        println!("Transport SHM [1a]");
         let _ = ztimeout!(peer_shm01_manager
             .add_listener(endpoint.clone())
             .timeout(TIMEOUT))
@@ -212,7 +221,7 @@ mod tests {
             let bs = unsafe { sbuf.as_mut_slice() };
             bs[0..8].copy_from_slice(&msg_count.to_le_bytes());
 
-            let key = "/test".into();
+            let key = "test".into();
             let payload: ZBuf = sbuf.into();
             let channel = Channel {
                 priority: Priority::default(),
@@ -242,7 +251,7 @@ mod tests {
         task::sleep(SLEEP).await;
 
         // Wait for the messages to arrive to the other side
-        println!("\nTransport SHM [3b]");
+        println!("Transport SHM [3b]");
         ztimeout!(async {
             while peer_shm02_handler.get_count() != MSG_COUNT {
                 task::sleep(SLEEP).await;
@@ -265,7 +274,7 @@ mod tests {
             let bs = unsafe { sbuf.as_mut_slice() };
             bs[0..8].copy_from_slice(&msg_count.to_le_bytes());
 
-            let key = "/test".into();
+            let key = "test".into();
             let payload: ZBuf = sbuf.into();
             let channel = Channel {
                 priority: Priority::default(),
@@ -295,7 +304,7 @@ mod tests {
         task::sleep(SLEEP).await;
 
         // Wait for the messages to arrive to the other side
-        println!("\nTransport SHM [4b]");
+        println!("Transport SHM [4b]");
         ztimeout!(async {
             while peer_net01_handler.get_count() != MSG_COUNT {
                 task::sleep(SLEEP).await;
@@ -341,22 +350,24 @@ mod tests {
     #[cfg(all(feature = "transport_tcp", feature = "shared-memory"))]
     #[test]
     fn transport_tcp_shm() {
+        let _ = env_logger::try_init();
         task::block_on(async {
             zasync_executor_init!();
         });
 
-        let endpoint: EndPoint = "tcp/127.0.0.1:16447".parse().unwrap();
+        let endpoint: EndPoint = format!("tcp/127.0.0.1:{}", 14000).parse().unwrap();
         task::block_on(run(&endpoint));
     }
 
     #[cfg(all(feature = "transport_ws", feature = "shared-memory"))]
     #[test]
     fn transport_ws_shm() {
+        let _ = env_logger::try_init();
         task::block_on(async {
             zasync_executor_init!();
         });
 
-        let endpoint: EndPoint = "ws/127.0.0.1:16448".parse().unwrap();
+        let endpoint: EndPoint = format!("ws/127.0.0.1:{}", 14010).parse().unwrap();
         task::block_on(run(&endpoint));
     }
 }

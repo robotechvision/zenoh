@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -12,9 +12,10 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use clap::{App, Arg};
-use zenoh::buf::SharedMemoryManager;
 use zenoh::config::Config;
+use zenoh::prelude::r#async::*;
 use zenoh::publication::CongestionControl;
+use zenoh::shm::SharedMemoryManager;
 
 #[async_std::main]
 async fn main() {
@@ -22,23 +23,21 @@ async fn main() {
     env_logger::init();
     let (config, sm_size, size) = parse_args();
 
-    let z = zenoh::open(config).await.unwrap();
-    let id = z.id().await;
-    let mut shm = SharedMemoryManager::make(id, sm_size).unwrap();
+    let z = zenoh::open(config).res().await.unwrap();
+    let id = z.zid();
+    let mut shm = SharedMemoryManager::make(id.to_string(), sm_size).unwrap();
     let mut buf = shm.alloc(size).unwrap();
     let bs = unsafe { buf.as_mut_slice() };
     for b in bs {
         *b = rand::random::<u8>();
     }
 
-    let key_expr = z.declare_expr("/test/thr").await.unwrap();
+    let publisher = z.declare_publisher("test/thr")
+    // Make sure to not drop messages because of congestion control
+    .congestion_control(CongestionControl::Block).res().await.unwrap();
 
     loop {
-        z.put(&key_expr, buf.clone())
-            // Make sure to not drop messages because of congestion control
-            .congestion_control(CongestionControl::Block)
-            .await
-            .unwrap();
+        publisher.put(buf.clone()).res().await.unwrap();
     }
 }
 

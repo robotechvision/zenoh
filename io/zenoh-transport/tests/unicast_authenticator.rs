@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,22 +11,19 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use async_std::prelude::FutureExt;
-use async_std::task;
+use async_std::{prelude::FutureExt, task};
 #[cfg(feature = "auth_pubkey")]
 use rsa::{BigUint, RsaPrivateKey, RsaPublicKey};
-use std::any::Any;
 #[cfg(feature = "auth_usrpwd")]
 use std::collections::HashMap;
-use std::collections::HashSet;
-use std::iter::FromIterator;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{any::Any, collections::HashSet, iter::FromIterator, sync::Arc, time::Duration};
 use zenoh_core::zasync_executor_init;
-use zenoh_core::Result as ZResult;
-use zenoh_link::{EndPoint, Link};
-use zenoh_protocol::core::{PeerId, WhatAmI};
-use zenoh_protocol::proto::ZenohMessage;
+use zenoh_link::Link;
+use zenoh_protocol::{
+    core::{EndPoint, WhatAmI, ZenohId},
+    zenoh::ZenohMessage,
+};
+use zenoh_result::ZResult;
 #[cfg(feature = "auth_pubkey")]
 use zenoh_transport::unicast::establishment::authenticator::PubKeyAuthenticator;
 #[cfg(feature = "shared-memory")]
@@ -34,7 +31,7 @@ use zenoh_transport::unicast::establishment::authenticator::SharedMemoryAuthenti
 #[cfg(feature = "auth_usrpwd")]
 use zenoh_transport::unicast::establishment::authenticator::UserPasswordAuthenticator;
 use zenoh_transport::{
-    DummyTransportPeerEventHandler, TransportEventHandler, TransportManager, TransportMulticast,
+    DummyTransportPeerEventHandler, TransportEventHandler, TransportMulticast,
     TransportMulticastEventHandler, TransportPeer, TransportPeerEventHandler, TransportUnicast,
 };
 
@@ -118,8 +115,10 @@ impl TransportEventHandler for SHClientAuthenticator {
 
 #[cfg(feature = "auth_pubkey")]
 async fn authenticator_multilink(endpoint: &EndPoint) {
+    use zenoh_transport::TransportManager;
+
     // Create the router transport manager
-    let router_id = PeerId::new(1, [0u8; PeerId::MAX_SIZE]);
+    let router_id = ZenohId::try_from([1]).unwrap();
     let router_handler = Arc::new(SHRouterAuthenticator::new());
     let n = BigUint::from_bytes_le(&[
         0x31, 0xd1, 0xfc, 0x7e, 0x70, 0x5f, 0xd7, 0xe3, 0xcc, 0xa4, 0xca, 0xcb, 0x38, 0x84, 0x2f,
@@ -158,20 +157,20 @@ async fn authenticator_multilink(endpoint: &EndPoint) {
             0x18, 0x78, 0x18, 0xd0,
         ]),
     ];
-    let router_pri_key = RsaPrivateKey::from_components(n, e, d, primes);
+    let router_pri_key = RsaPrivateKey::from_components(n, e, d, primes).unwrap();
     let peer_auth_router = Arc::new(PubKeyAuthenticator::new(router_pub_key, router_pri_key));
     let unicast = TransportManager::config_unicast()
         .max_links(2)
         .peer_authenticator(HashSet::from_iter(vec![peer_auth_router.clone().into()]));
     let router_manager = TransportManager::builder()
         .whatami(WhatAmI::Router)
-        .pid(router_id)
+        .zid(router_id)
         .unicast(unicast)
         .build(router_handler.clone())
         .unwrap();
 
     // Create the transport transport manager for the client 01
-    let client01_id = PeerId::new(1, [1_u8; PeerId::MAX_SIZE]);
+    let client01_id = ZenohId::try_from([2]).unwrap();
 
     let n = BigUint::from_bytes_le(&[
         0x41, 0x74, 0xc6, 0x40, 0x18, 0x63, 0xbd, 0x59, 0xe6, 0x0d, 0xe9, 0x23, 0x3e, 0x95, 0xca,
@@ -210,20 +209,20 @@ async fn authenticator_multilink(endpoint: &EndPoint) {
             0xaa, 0xf9, 0x6b, 0xdf,
         ]),
     ];
-    let client01_pri_key = RsaPrivateKey::from_components(n, e, d, primes);
+    let client01_pri_key = RsaPrivateKey::from_components(n, e, d, primes).unwrap();
     let peer_auth_client01 = PubKeyAuthenticator::new(client01_pub_key, client01_pri_key);
     let unicast = TransportManager::config_unicast()
         .max_links(2)
         .peer_authenticator(HashSet::from_iter(vec![peer_auth_client01.into()]));
     let client01_manager = TransportManager::builder()
         .whatami(WhatAmI::Client)
-        .pid(client01_id)
+        .zid(client01_id)
         .unicast(unicast)
         .build(Arc::new(SHClientAuthenticator::default()))
         .unwrap();
 
     // Create the transport transport manager for the client 02
-    let client02_id = PeerId::new(1, [2_u8; PeerId::MAX_SIZE]);
+    let client02_id = ZenohId::try_from([3]).unwrap();
 
     let n = BigUint::from_bytes_le(&[
         0xd1, 0x36, 0xcf, 0x94, 0xda, 0x04, 0x7e, 0x9f, 0x53, 0x39, 0xb8, 0x7b, 0x53, 0x3a, 0xe6,
@@ -262,7 +261,7 @@ async fn authenticator_multilink(endpoint: &EndPoint) {
             0xb9, 0xbc, 0xdd, 0xe8,
         ]),
     ];
-    let client02_pri_key = RsaPrivateKey::from_components(n, e, d, primes);
+    let client02_pri_key = RsaPrivateKey::from_components(n, e, d, primes).unwrap();
 
     let peer_auth_client02 = PubKeyAuthenticator::new(client02_pub_key, client02_pri_key);
     let unicast = TransportManager::config_unicast()
@@ -270,7 +269,7 @@ async fn authenticator_multilink(endpoint: &EndPoint) {
         .peer_authenticator(HashSet::from_iter(vec![peer_auth_client02.into()]));
     let client02_manager = TransportManager::builder()
         .whatami(WhatAmI::Client)
-        .pid(client02_id)
+        .zid(client02_id)
         .unicast(unicast)
         .build(Arc::new(SHClientAuthenticator::default()))
         .unwrap();
@@ -315,7 +314,7 @@ async fn authenticator_multilink(endpoint: &EndPoint) {
             0x5d, 0x66, 0xdf, 0xf0,
         ]),
     ];
-    let client01_spoof_pri_key = RsaPrivateKey::from_components(n, e, d, primes);
+    let client01_spoof_pri_key = RsaPrivateKey::from_components(n, e, d, primes).unwrap();
 
     let peer_auth_client01_spoof =
         PubKeyAuthenticator::new(client01_spoof_pub_key, client01_spoof_pri_key);
@@ -324,7 +323,7 @@ async fn authenticator_multilink(endpoint: &EndPoint) {
         .peer_authenticator(HashSet::from_iter(vec![peer_auth_client01_spoof.into()]));
     let client01_spoof_manager = TransportManager::builder()
         .whatami(WhatAmI::Client)
-        .pid(client01_spoof_id)
+        .zid(client01_spoof_id)
         .unicast(unicast)
         .build(Arc::new(SHClientAuthenticator::default()))
         .unwrap();
@@ -335,7 +334,7 @@ async fn authenticator_multilink(endpoint: &EndPoint) {
     ztimeout!(router_manager.add_listener(endpoint.clone())).unwrap();
     println!("Transport Authenticator PubKey [1a2]");
     let locators = router_manager.get_listeners();
-    println!("Transport Authenticator PubKey [1a2]: {:?}", locators);
+    println!("Transport Authenticator PubKey [1a2]: {locators:?}");
     assert_eq!(locators.len(), 1);
 
     /* [2a] */
@@ -358,7 +357,7 @@ async fn authenticator_multilink(endpoint: &EndPoint) {
     // -> This should be rejected
     println!("Transport Authenticator PubKey [2c1]");
     let res = ztimeout!(client01_manager.open_transport(endpoint.clone()));
-    println!("Transport Authenticator PubKey [2c2]: {:?}", res);
+    println!("Transport Authenticator PubKey [2c2]: {res:?}");
     assert!(res.is_err());
     assert_eq!(c_ses1.get_links().unwrap().len(), 2);
 
@@ -393,7 +392,7 @@ async fn authenticator_multilink(endpoint: &EndPoint) {
     // -> This should be rejected
     println!("Transport Authenticator PubKey [3c1]");
     let res = ztimeout!(client02_manager.open_transport(endpoint.clone()));
-    println!("Transport Authenticator PubKey [3c2]: {:?}", res);
+    println!("Transport Authenticator PubKey [3c2]: {res:?}");
     assert!(res.is_err());
     assert_eq!(c_ses2.get_links().unwrap().len(), 2);
 
@@ -401,7 +400,7 @@ async fn authenticator_multilink(endpoint: &EndPoint) {
     // Close the session
     println!("Transport Authenticator PubKey [3d1]");
     let res = ztimeout!(c_ses2.close());
-    println!("Transport Authenticator PubKey [3d2]: {:?}", res);
+    println!("Transport Authenticator PubKey [3d2]: {res:?}");
     assert!(res.is_ok());
 
     ztimeout!(async {
@@ -415,7 +414,7 @@ async fn authenticator_multilink(endpoint: &EndPoint) {
     // -> This should be accepted
     println!("Transport Authenticator PubKey [4a1]");
     let res = ztimeout!(client01_spoof_manager.open_transport(endpoint.clone()));
-    println!("Transport Authenticator PubKey [4a2]: {:?}", res);
+    println!("Transport Authenticator PubKey [4a2]: {res:?}");
     assert!(res.is_ok());
     let c_ses1_spoof = res.unwrap();
     assert_eq!(c_ses1_spoof.get_links().unwrap().len(), 1);
@@ -425,7 +424,7 @@ async fn authenticator_multilink(endpoint: &EndPoint) {
     // -> This should be accepted
     println!("Transport Authenticator PubKey [4b1]");
     let res = ztimeout!(client01_spoof_manager.open_transport(endpoint.clone()));
-    println!("Transport Authenticator PubKey [4b2]: {:?}", res);
+    println!("Transport Authenticator PubKey [4b2]: {res:?}");
     assert!(res.is_ok());
     assert_eq!(c_ses1_spoof.get_links().unwrap().len(), 2);
 
@@ -434,7 +433,7 @@ async fn authenticator_multilink(endpoint: &EndPoint) {
     // -> This should be rejected
     println!("Transport Authenticator PubKey [41]");
     let res = ztimeout!(client01_spoof_manager.open_transport(endpoint.clone()));
-    println!("Transport Authenticator PubKey [4c2]: {:?}", res);
+    println!("Transport Authenticator PubKey [4c2]: {res:?}");
     assert!(res.is_err());
     assert_eq!(c_ses1_spoof.get_links().unwrap().len(), 2);
 
@@ -442,7 +441,7 @@ async fn authenticator_multilink(endpoint: &EndPoint) {
     // Close the session
     println!("Transport Authenticator PubKey [4d1]");
     let res = ztimeout!(c_ses1_spoof.close());
-    println!("Transport Authenticator PubKey [4d2]: {:?}", res);
+    println!("Transport Authenticator PubKey [4d2]: {res:?}");
     assert!(res.is_ok());
 
     ztimeout!(async {
@@ -456,7 +455,7 @@ async fn authenticator_multilink(endpoint: &EndPoint) {
     // -> This should be accepted
     println!("Transport Authenticator PubKey [5a1]");
     let res = ztimeout!(client01_manager.open_transport(endpoint.clone()));
-    println!("Transport Authenticator PubKey [5a2]: {:?}", res);
+    println!("Transport Authenticator PubKey [5a2]: {res:?}");
     assert!(res.is_ok());
     let c_ses1 = res.unwrap();
     assert_eq!(c_ses1.get_links().unwrap().len(), 1);
@@ -466,7 +465,7 @@ async fn authenticator_multilink(endpoint: &EndPoint) {
     // -> This should be rejected. Spoofing detected.
     println!("Transport Authenticator PubKey [5b1]");
     let res = ztimeout!(client01_spoof_manager.open_transport(endpoint.clone()));
-    println!("Transport Authenticator PubKey [5b2]: {:?}", res);
+    println!("Transport Authenticator PubKey [5b2]: {res:?}");
     assert!(res.is_err());
 
     /* [5c] */
@@ -474,7 +473,7 @@ async fn authenticator_multilink(endpoint: &EndPoint) {
     // -> This should be accepted
     println!("Transport Authenticator PubKey [5a1]");
     let res = ztimeout!(client01_manager.open_transport(endpoint.clone()));
-    println!("Transport Authenticator PubKey [5a2]: {:?}", res);
+    println!("Transport Authenticator PubKey [5a2]: {res:?}");
     assert!(res.is_ok());
     let c_ses1 = res.unwrap();
     assert_eq!(c_ses1.get_links().unwrap().len(), 2);
@@ -483,7 +482,7 @@ async fn authenticator_multilink(endpoint: &EndPoint) {
     // Close the session
     println!("Transport Authenticator PubKey [5d1]");
     let res = ztimeout!(c_ses1.close());
-    println!("Transport Authenticator PubKey [5d2]: {:?}", res);
+    println!("Transport Authenticator PubKey [5d2]: {res:?}");
     assert!(res.is_ok());
 
     ztimeout!(async {
@@ -496,7 +495,7 @@ async fn authenticator_multilink(endpoint: &EndPoint) {
     // Perform clean up of the open locators
     println!("Transport Authenticator UserPassword [6a1]");
     let res = ztimeout!(router_manager.del_listener(endpoint));
-    println!("Transport Authenticator UserPassword [6a2]: {:?}", res);
+    println!("Transport Authenticator UserPassword [6a2]: {res:?}");
     assert!(res.is_ok());
 
     ztimeout!(async {
@@ -515,12 +514,14 @@ async fn authenticator_multilink(endpoint: &EndPoint) {
 
 #[cfg(feature = "auth_usrpwd")]
 async fn authenticator_user_password(endpoint: &EndPoint) {
+    use zenoh_transport::TransportManager;
+
     /* [CLIENT] */
-    let client01_id = PeerId::new(1, [1_u8; PeerId::MAX_SIZE]);
+    let client01_id = ZenohId::try_from([2]).unwrap();
     let user01 = "user01".to_string();
     let password01 = "password01".to_string();
 
-    let client02_id = PeerId::new(1, [2_u8; PeerId::MAX_SIZE]);
+    let client02_id = ZenohId::try_from([3]).unwrap();
     let user02 = "invalid".to_string();
     let password02 = "invalid".to_string();
 
@@ -529,7 +530,7 @@ async fn authenticator_user_password(endpoint: &EndPoint) {
     let password03 = "password03".to_string();
 
     /* [ROUTER] */
-    let router_id = PeerId::new(1, [0_u8; PeerId::MAX_SIZE]);
+    let router_id = ZenohId::try_from([1]).unwrap();
     let router_handler = Arc::new(SHRouterAuthenticator::new());
     // Create the router transport manager
     let mut lookup: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
@@ -541,7 +542,7 @@ async fn authenticator_user_password(endpoint: &EndPoint) {
         .peer_authenticator(HashSet::from_iter(vec![peer_auth_router.clone().into()]));
     let router_manager = TransportManager::builder()
         .whatami(WhatAmI::Router)
-        .pid(router_id)
+        .zid(router_id)
         .unicast(unicast)
         .build(router_handler.clone())
         .unwrap();
@@ -556,7 +557,7 @@ async fn authenticator_user_password(endpoint: &EndPoint) {
         .peer_authenticator(HashSet::from_iter(vec![peer_auth_client01.into()]));
     let client01_manager = TransportManager::builder()
         .whatami(WhatAmI::Client)
-        .pid(client01_id)
+        .zid(client01_id)
         .unicast(unicast)
         .build(Arc::new(SHClientAuthenticator::default()))
         .unwrap();
@@ -571,7 +572,7 @@ async fn authenticator_user_password(endpoint: &EndPoint) {
         .peer_authenticator(HashSet::from_iter(vec![peer_auth_client02.into()]));
     let client02_manager = TransportManager::builder()
         .whatami(WhatAmI::Client)
-        .pid(client02_id)
+        .zid(client02_id)
         .unicast(unicast)
         .build(Arc::new(SHClientAuthenticator::default()))
         .unwrap();
@@ -586,7 +587,7 @@ async fn authenticator_user_password(endpoint: &EndPoint) {
         .peer_authenticator(HashSet::from_iter(vec![peer_auth_client03.into()]));
     let client03_manager = TransportManager::builder()
         .whatami(WhatAmI::Client)
-        .pid(client03_id)
+        .zid(client03_id)
         .unicast(unicast)
         .build(Arc::new(SHClientAuthenticator::default()))
         .unwrap();
@@ -595,11 +596,11 @@ async fn authenticator_user_password(endpoint: &EndPoint) {
     println!("\nTransport Authenticator UserPassword [1a1]");
     // Add the locator on the router
     let res = ztimeout!(router_manager.add_listener(endpoint.clone()));
-    println!("Transport Authenticator UserPassword [1a1]: {:?}", res);
+    println!("Transport Authenticator UserPassword [1a1]: {res:?}");
     assert!(res.is_ok());
     println!("Transport Authenticator UserPassword [1a2]");
     let locators = router_manager.get_listeners();
-    println!("Transport Authenticator UserPassword [1a2]: {:?}", locators);
+    println!("Transport Authenticator UserPassword [1a2]: {locators:?}");
     assert_eq!(locators.len(), 1);
 
     /* [2] */
@@ -607,14 +608,14 @@ async fn authenticator_user_password(endpoint: &EndPoint) {
     // -> This should be accepted
     println!("Transport Authenticator UserPassword [2a1]");
     let res = ztimeout!(client01_manager.open_transport(endpoint.clone()));
-    println!("Transport Authenticator UserPassword [2a1]: {:?}", res);
+    println!("Transport Authenticator UserPassword [2a1]: {res:?}");
     assert!(res.is_ok());
     let c_ses1 = res.unwrap();
 
     /* [3] */
     println!("Transport Authenticator UserPassword [3a1]");
     let res = ztimeout!(c_ses1.close());
-    println!("Transport Authenticator UserPassword [3a1]: {:?}", res);
+    println!("Transport Authenticator UserPassword [3a1]: {res:?}");
     assert!(res.is_ok());
 
     ztimeout!(async {
@@ -628,7 +629,7 @@ async fn authenticator_user_password(endpoint: &EndPoint) {
     // -> This should be rejected
     println!("Transport Authenticator UserPassword [4a1]");
     let res = ztimeout!(client02_manager.open_transport(endpoint.clone()));
-    println!("Transport Authenticator UserPassword [4a1]: {:?}", res);
+    println!("Transport Authenticator UserPassword [4a1]: {res:?}");
     assert!(res.is_err());
 
     /* [5] */
@@ -636,7 +637,7 @@ async fn authenticator_user_password(endpoint: &EndPoint) {
     // -> This should be accepted
     println!("Transport Authenticator UserPassword [5a1]");
     let res = ztimeout!(client01_manager.open_transport(endpoint.clone()));
-    println!("Transport Authenticator UserPassword [5a1]: {:?}", res);
+    println!("Transport Authenticator UserPassword [5a1]: {res:?}");
     assert!(res.is_ok());
     let c_ses1 = res.unwrap();
 
@@ -648,7 +649,7 @@ async fn authenticator_user_password(endpoint: &EndPoint) {
     // -> This should be accepted
     println!("Transport Authenticator UserPassword [6a1]");
     let res = ztimeout!(client02_manager.open_transport(endpoint.clone()));
-    println!("Transport Authenticator UserPassword [6a1]: {:?}", res);
+    println!("Transport Authenticator UserPassword [6a1]: {res:?}");
     assert!(res.is_ok());
     let c_ses2 = res.unwrap();
 
@@ -657,17 +658,17 @@ async fn authenticator_user_password(endpoint: &EndPoint) {
     // -> This should be rejected
     println!("Transport Authenticator UserPassword [7a1]");
     let res = ztimeout!(client03_manager.open_transport(endpoint.clone()));
-    println!("Transport Authenticator UserPassword [7a1]: {:?}", res);
+    println!("Transport Authenticator UserPassword [7a1]: {res:?}");
     assert!(res.is_err());
 
     /* [8] */
     println!("Transport Authenticator UserPassword [8a1]");
     let res = ztimeout!(c_ses1.close());
-    println!("Transport Authenticator UserPassword [8a1]: {:?}", res);
+    println!("Transport Authenticator UserPassword [8a1]: {res:?}");
     assert!(res.is_ok());
     println!("Transport Authenticator UserPassword [8a2]");
     let res = ztimeout!(c_ses2.close());
-    println!("Transport Authenticator UserPassword [8a2]: {:?}", res);
+    println!("Transport Authenticator UserPassword [8a2]: {res:?}");
     assert!(res.is_ok());
 
     ztimeout!(async {
@@ -680,7 +681,7 @@ async fn authenticator_user_password(endpoint: &EndPoint) {
     // Perform clean up of the open locators
     println!("Transport Authenticator UserPassword [9a1]");
     let res = ztimeout!(router_manager.del_listener(endpoint));
-    println!("Transport Authenticator UserPassword [9a2]: {:?}", res);
+    println!("Transport Authenticator UserPassword [9a2]: {res:?}");
     assert!(res.is_ok());
 
     ztimeout!(async {
@@ -695,11 +696,13 @@ async fn authenticator_user_password(endpoint: &EndPoint) {
 
 #[cfg(feature = "shared-memory")]
 async fn authenticator_shared_memory(endpoint: &EndPoint) {
+    use zenoh_transport::TransportManager;
+
     /* [CLIENT] */
-    let client_id = PeerId::new(1, [1u8; PeerId::MAX_SIZE]);
+    let client_id = ZenohId::try_from([2]).unwrap();
 
     /* [ROUTER] */
-    let router_id = PeerId::new(1, [0_u8; PeerId::MAX_SIZE]);
+    let router_id = ZenohId::try_from([1]).unwrap();
     let router_handler = Arc::new(SHRouterAuthenticator::new());
     // Create the router transport manager
     let peer_auth_router = SharedMemoryAuthenticator::make().unwrap();
@@ -707,7 +710,7 @@ async fn authenticator_shared_memory(endpoint: &EndPoint) {
         .peer_authenticator(HashSet::from_iter(vec![peer_auth_router.into()]));
     let router_manager = TransportManager::builder()
         .whatami(WhatAmI::Router)
-        .pid(router_id)
+        .zid(router_id)
         .unicast(unicast)
         .build(router_handler.clone())
         .unwrap();
@@ -718,7 +721,7 @@ async fn authenticator_shared_memory(endpoint: &EndPoint) {
         .peer_authenticator(HashSet::from_iter(vec![peer_auth_client.into()]));
     let client_manager = TransportManager::builder()
         .whatami(WhatAmI::Router)
-        .pid(client_id)
+        .zid(client_id)
         .unicast(unicast)
         .build(Arc::new(SHClientAuthenticator::default()))
         .unwrap();
@@ -727,11 +730,11 @@ async fn authenticator_shared_memory(endpoint: &EndPoint) {
     println!("\nTransport Authenticator SharedMemory [1a1]");
     // Add the locator on the router
     let res = ztimeout!(router_manager.add_listener(endpoint.clone()));
-    println!("Transport Authenticator SharedMemory [1a1]: {:?}", res);
+    println!("Transport Authenticator SharedMemory [1a1]: {res:?}");
     assert!(res.is_ok());
     println!("Transport Authenticator SharedMemory [1a2]");
     let locators = router_manager.get_listeners();
-    println!("Transport Authenticator SharedMemory 1a2]: {:?}", locators);
+    println!("Transport Authenticator SharedMemory 1a2]: {locators:?}");
     assert_eq!(locators.len(), 1);
 
     /* [2] */
@@ -739,7 +742,7 @@ async fn authenticator_shared_memory(endpoint: &EndPoint) {
     // -> This should be accepted
     println!("Transport Authenticator SharedMemory [2a1]");
     let res = ztimeout!(client_manager.open_transport(endpoint.clone()));
-    println!("Transport Authenticator SharedMemory [2a1]: {:?}", res);
+    println!("Transport Authenticator SharedMemory [2a1]: {res:?}");
     assert!(res.is_ok());
     let c_ses1 = res.unwrap();
     assert!(c_ses1.is_shm().unwrap());
@@ -747,7 +750,7 @@ async fn authenticator_shared_memory(endpoint: &EndPoint) {
     /* [3] */
     println!("Transport Authenticator SharedMemory [3a1]");
     let res = ztimeout!(c_ses1.close());
-    println!("Transport Authenticator SharedMemory [3a1]: {:?}", res);
+    println!("Transport Authenticator SharedMemory [3a1]: {res:?}");
     assert!(res.is_ok());
 
     ztimeout!(async {
@@ -760,7 +763,7 @@ async fn authenticator_shared_memory(endpoint: &EndPoint) {
     // Perform clean up of the open locators
     println!("Transport Authenticator SharedMemory [4a1]");
     let res = ztimeout!(router_manager.del_listener(endpoint));
-    println!("Transport Authenticator SharedMemory [4a2]: {:?}", res);
+    println!("Transport Authenticator SharedMemory [4a2]: {res:?}");
     assert!(res.is_ok());
 
     ztimeout!(async {
@@ -784,50 +787,53 @@ async fn run(endpoint: &EndPoint) {
 #[cfg(feature = "transport_tcp")]
 #[test]
 fn authenticator_tcp() {
+    let _ = env_logger::try_init();
     task::block_on(async {
         zasync_executor_init!();
     });
 
-    let endpoint: EndPoint = "tcp/127.0.0.1:11447".parse().unwrap();
+    let endpoint: EndPoint = format!("tcp/127.0.0.1:{}", 8000).parse().unwrap();
     task::block_on(run(&endpoint));
 }
 
 #[cfg(feature = "transport_udp")]
 #[test]
 fn authenticator_udp() {
+    let _ = env_logger::try_init();
     task::block_on(async {
         zasync_executor_init!();
     });
 
-    let endpoint: EndPoint = "udp/127.0.0.1:11447".parse().unwrap();
+    let endpoint: EndPoint = format!("udp/127.0.0.1:{}", 8010).parse().unwrap();
     task::block_on(run(&endpoint));
 }
 
 #[cfg(feature = "transport_ws")]
 #[test]
 fn authenticator_ws() {
+    let _ = env_logger::try_init();
     task::block_on(async {
         zasync_executor_init!();
     });
 
-    let endpoint: EndPoint = "ws/127.0.0.1:11449".parse().unwrap();
+    let endpoint: EndPoint = format!("ws/127.0.0.1:{}", 8020).parse().unwrap();
     task::block_on(run(&endpoint));
 }
 
 #[cfg(all(feature = "transport_unixsock-stream", target_family = "unix"))]
 #[test]
 fn authenticator_unix() {
+    let _ = env_logger::try_init();
     task::block_on(async {
         zasync_executor_init!();
     });
 
-    let _ = std::fs::remove_file("zenoh-test-unix-socket-10.sock");
-    let endpoint: EndPoint = "unixsock-stream/zenoh-test-unix-socket-10.sock"
-        .parse()
-        .unwrap();
+    let f1 = "zenoh-test-unix-socket-10.sock";
+    let _ = std::fs::remove_file(f1);
+    let endpoint: EndPoint = format!("unixsock-stream/{f1}").parse().unwrap();
     task::block_on(run(&endpoint));
-    let _ = std::fs::remove_file("zenoh-test-unix-socket-10.sock");
-    let _ = std::fs::remove_file("zenoh-test-unix-socket-10.sock.lock");
+    let _ = std::fs::remove_file(f1);
+    let _ = std::fs::remove_file(format!("{f1}.lock"));
 }
 
 #[cfg(feature = "transport_tls")]
@@ -835,6 +841,7 @@ fn authenticator_unix() {
 fn authenticator_tls() {
     use zenoh_link::tls::config::*;
 
+    let _ = env_logger::try_init();
     task::block_on(async {
         zasync_executor_init!();
     });
@@ -844,86 +851,90 @@ fn authenticator_tls() {
     //       mapping to any existing domain. The certificate and key
     //       have been generated using: https://github.com/jsha/minica
     let key = "-----BEGIN RSA PRIVATE KEY-----
-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
+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
 -----END RSA PRIVATE KEY-----";
 
     let cert = "-----BEGIN CERTIFICATE-----
-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
+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
+abY=
 -----END CERTIFICATE-----";
 
     // Configure the client
     let ca = "-----BEGIN CERTIFICATE-----
-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
+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
-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
+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
 -----END CERTIFICATE-----";
 
     // Define the locator
-    let mut endpoint: EndPoint = "tls/localhost:11448".parse().unwrap();
-    endpoint.extend_configuration(
-        [
-            (TLS_ROOT_CA_CERTIFICATE_RAW, ca),
-            (TLS_SERVER_CERTIFICATE_RAW, cert),
-            (TLS_SERVER_PRIVATE_KEY_RAW, key),
-        ]
-        .iter()
-        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
-    );
+    let mut endpoint: EndPoint = format!("tls/localhost:{}", 8030).parse().unwrap();
+    endpoint
+        .config_mut()
+        .extend(
+            [
+                (TLS_ROOT_CA_CERTIFICATE_RAW, ca),
+                (TLS_SERVER_CERTIFICATE_RAW, cert),
+                (TLS_SERVER_PRIVATE_KEY_RAW, key),
+            ]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+        )
+        .unwrap();
 
     task::block_on(run(&endpoint));
 }
@@ -933,6 +944,7 @@ tOzot3pwe+3SJtpk90xAQrABEO0Zh2unrC8i83ySfg==
 fn authenticator_quic() {
     use zenoh_link::quic::config::*;
 
+    let _ = env_logger::try_init();
     task::block_on(async {
         zasync_executor_init!();
     });
@@ -942,86 +954,90 @@ fn authenticator_quic() {
     //       mapping to any existing domain. The certificate and key
     //       have been generated using: https://github.com/jsha/minica
     let key = "-----BEGIN RSA PRIVATE KEY-----
-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
+MIIEpAIBAAKCAQEAsfqAuhElN4HnyeqLovSd4Qe+nNv5AwCjSO+HFiF30x3vQ1Hi
+qRA0UmyFlSqBnFH3TUHm4Jcad40QfrX8f11NKGZdpvKHsMYqYjZnYkRFGS2s4fQy
+aDbV5M06s3UDX8ETPgY41Y8fCKTSVdi9iHkwcVrXMxUu4IBBx0C1r2GSo3gkIBnU
+cELdFdaUOSbdCipJhbnkwixEr2h7PXxwba7SIZgZtRaQWak1VE9b716qe3iMuMha
+Efo/UoFmeZCPu5spfwaOZsnCsxRPk2IjbzlsHTJ09lM9wmbEFHBMVAXejLTk++Sr
+Xt8jASZhNen/2GzyLQNAquGn98lCMQ6SsE9vLQIDAQABAoIBAGQkKggHm6Q20L+4
+2+bNsoOqguLplpvM4RMpyx11qWE9h6GeUmWD+5yg+SysJQ9aw0ZSHWEjRD4ePji9
+lxvm2IIxzuIftp+NcM2gBN2ywhpfq9XbO/2NVR6PJ0dQQJzBG12bzKDFDdYkP0EU
+WdiPL+WoEkvo0F57bAd77n6G7SZSgxYekBF+5S6rjbu5I1cEKW+r2vLehD4uFCVX
+Q0Tu7TyIOE1KJ2anRb7ZXVUaguNj0/Er7EDT1+wN8KJKvQ1tYGIq/UUBtkP9nkOI
+9XJd25k6m5AQPDddzd4W6/5+M7kjyVPi3CsQcpBPss6ueyecZOMaKqdWAHeEyaak
+r67TofUCgYEA6GBa+YkRvp0Ept8cd5mh4gCRM8wUuhtzTQnhubCPivy/QqMWScdn
+qD0OiARLAsqeoIfkAVgyqebVnxwTrKTvWe0JwpGylEVWQtpGz3oHgjST47yZxIiY
+CSAaimi2CYnJZ+QB2oBkFVwNCuXdPEGX6LgnOGva19UKrm6ONsy6V9MCgYEAxBJu
+fu4dGXZreARKEHa/7SQjI9ayAFuACFlON/EgSlICzQyG/pumv1FsMEiFrv6w7PRj
+4AGqzyzGKXWVDRMrUNVeGPSKJSmlPGNqXfPaXRpVEeB7UQhAs5wyMrWDl8jEW7Ih
+XcWhMLn1f/NOAKyrSDSEaEM+Nuu+xTifoAghvP8CgYEAlta9Fw+nihDIjT10cBo0
+38w4dOP7bFcXQCGy+WMnujOYPzw34opiue1wOlB3FIfL8i5jjY/fyzPA5PhHuSCT
+Ec9xL3B9+AsOFHU108XFi/pvKTwqoE1+SyYgtEmGKKjdKOfzYA9JaCgJe1J8inmV
+jwXCx7gTJVjwBwxSmjXIm+sCgYBQF8NhQD1M0G3YCdCDZy7BXRippCL0OGxVfL2R
+5oKtOVEBl9NxH/3+evE5y/Yn5Mw7Dx3ZPHUcygpslyZ6v9Da5T3Z7dKcmaVwxJ+H
+n3wcugv0EIHvOPLNK8npovINR6rGVj6BAqD0uZHKYYYEioQxK5rGyGkaoDQ+dgHm
+qku12wKBgQDem5FvNp5iW7mufkPZMqf3sEGtu612QeqejIPFM1z7VkUgetsgPBXD
+tYsqC2FtWzY51VOEKNpnfH7zH5n+bjoI9nAEAW63TK9ZKkr2hRGsDhJdGzmLfQ7v
+F6/CuIw9EsAq6qIB8O88FXQqald+BZOx6AzB8Oedsz/WtMmIEmr/+Q==
 -----END RSA PRIVATE KEY-----";
 
     let cert = "-----BEGIN CERTIFICATE-----
-MIIDLDCCAhSgAwIBAgIIIXlwQVKrtaAwDQYJKoZIhvcNAQELBQAwIDEeMBwGA1UE
-AxMVbWluaWNhIHJvb3QgY2EgMmJiOTlkMB4XDTIxMDIwMjE0NDYzNFoXDTIzMDMw
-NDE0NDYzNFowFDESMBAGA1UEAxMJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
-AAOCAQ8AMIIBCgKCAQEAz105EYUbOdW5uJ8o/TqtxtOtKJL7AQdy5yiXoslosAsu
-laew4JSJetVa6Fa6Bq5BK6fsphGD9bpGGeiBZFBt75JRjOrkj4DwlLGa0CPLTgG5
-hul4Ufe9B7VG3J5P8OwUqIYmPzj8uTbNtkgFRcYumHR28h4GkYdG5Y04AV4vIjgK
-E47jAgV5ACRHkcmGrTzF2HOes2wT73l4yLSkKR4GlIWu5cLRdI8PTUmjMFAh/GIh
-1ahd+VqXz051V3jok0n1klVNjc6DnWuH3j/MSOg/52C3YfcUjCeIJGVfcqDnPTJK
-SNEFyVTYCUjWy+B0B4fMz3MpU17dDWpvS5hfc4VrgQIDAQABo3YwdDAOBgNVHQ8B
-Af8EBAMCBaAwHQYDVR0lBBYwFAYIKwYBBQUHAwEGCCsGAQUFBwMCMAwGA1UdEwEB
-/wQCMAAwHwYDVR0jBBgwFoAULXa6lBiO7OLL5Z6XuF5uF5wR9PQwFAYDVR0RBA0w
-C4IJbG9jYWxob3N0MA0GCSqGSIb3DQEBCwUAA4IBAQBOMkNXfzPEDU475zbiSi3v
-JOhpZLyuoaYY62RzZc9VF8YRybJlWKUWdR3szAiUd1xCJe/beNX7b9lPg6wNadKq
-DGTWFmVxSfpVMO9GQYBXLDcNaAUXzsDLC5sbAFST7jkAJELiRn6KtQYxZ2kEzo7G
-QmzNMfNMc1KeL8Qr4nfEHZx642yscSWj9edGevvx4o48j5KXcVo9+pxQQFao9T2O
-F5QxyGdov+uNATWoYl92Gj8ERi7ovHimU3H7HLIwNPqMJEaX4hH/E/Oz56314E9b
-AXVFFIgCSluyrolaD6CWD9MqOex4YOfJR2bNxI7lFvuK4AwjyUJzT1U1HXib17mM
+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
+abY=
 -----END CERTIFICATE-----";
 
     // Configure the client
     let ca = "-----BEGIN CERTIFICATE-----
-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
+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
-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
+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
 -----END CERTIFICATE-----";
 
     // Define the locator
-    let mut endpoint: EndPoint = "quic/localhost:11448".parse().unwrap();
-    endpoint.extend_configuration(
-        [
-            (TLS_ROOT_CA_CERTIFICATE_RAW, ca),
-            (TLS_SERVER_CERTIFICATE_RAW, cert),
-            (TLS_SERVER_PRIVATE_KEY_RAW, key),
-        ]
-        .iter()
-        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
-    );
+    let mut endpoint: EndPoint = format!("quic/localhost:{}", 8040).parse().unwrap();
+    endpoint
+        .config_mut()
+        .extend(
+            [
+                (TLS_ROOT_CA_CERTIFICATE_RAW, ca),
+                (TLS_SERVER_CERTIFICATE_RAW, cert),
+                (TLS_SERVER_PRIVATE_KEY_RAW, key),
+            ]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+        )
+        .unwrap();
 
     task::block_on(run(&endpoint));
 }

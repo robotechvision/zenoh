@@ -1,4 +1,4 @@
-# Copyright (c) 2022 ZettaScale Technology
+# Copyright (c) 2023 ZettaScale Technology
 #
 # This program and the accompanying materials are made available under the
 # terms of the Eclipse Public License 2.0 which is available at
@@ -32,7 +32,7 @@ RUN echo 'echo " * Starting: /zenohd $*"' >> /entrypoint.sh
 RUN echo 'exec /zenohd $*' >> /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-EXPOSE 7447/udp
+EXPOSE 7446/udp
 EXPOSE 7447/tcp
 EXPOSE 8000/tcp
 

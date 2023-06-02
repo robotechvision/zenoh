@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -21,7 +21,7 @@
 pub mod loading;
 pub mod vtable;
 
-use zenoh_core::Result as ZResult;
+use zenoh_result::ZResult;
 
 #[repr(C)]
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -51,7 +51,11 @@ impl Compatibility {
         })
     }
     pub fn are_compatible(a: &Self, b: &Self) -> bool {
-        a == b
+        if a.stable && b.stable {
+            a.major == b.major && a.minor == b.minor && a.patch == b.patch
+        } else {
+            a == b
+        }
     }
 }
 

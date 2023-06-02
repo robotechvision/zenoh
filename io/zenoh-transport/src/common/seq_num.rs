@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,8 +11,8 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use super::protocol::core::ZInt;
-use zenoh_core::{bail, Result as ZResult};
+use zenoh_protocol::core::ZInt;
+use zenoh_result::{bail, ZResult};
 
 /// Sequence Number
 ///

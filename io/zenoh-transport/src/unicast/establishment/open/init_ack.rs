@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,24 +11,30 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use crate::unicast::establishment::authenticator::PeerAuthenticatorId;
 use crate::unicast::establishment::open::OResult;
-use crate::unicast::establishment::{attachment_from_properties, properties_from_attachment};
 use crate::unicast::establishment::{
     authenticator::AuthenticatedPeerLink, EstablishmentProperties,
 };
 use crate::TransportManager;
-use zenoh_core::{zasyncread, zerror};
+use std::convert::TryFrom;
+use zenoh_buffers::ZSlice;
+use zenoh_core::zasyncread;
 use zenoh_link::LinkUnicast;
-use zenoh_protocol::core::{PeerId, Property, WhatAmI, ZInt};
-use zenoh_protocol::io::ZSlice;
-use zenoh_protocol::proto::{tmsg, Attachment, Close, TransportBody};
+use zenoh_protocol::{
+    common::Attachment,
+    core::{Property, WhatAmI, ZInt, ZenohId},
+    transport::{tmsg, Close, TransportBody},
+};
+use zenoh_result::zerror;
+
+#[cfg(feature = "shared-memory")]
+use crate::unicast::establishment::authenticator::PeerAuthenticatorId;
 
 /*************************************/
 /*              OPEN                 */
 /*************************************/
 pub(super) struct Output {
-    pub(super) pid: PeerId,
+    pub(super) zid: ZenohId,
     pub(super) whatami: WhatAmI,
     pub(super) sn_resolution: ZInt,
     pub(super) is_qos: bool,
@@ -43,7 +49,10 @@ pub(super) async fn recv(
     _input: super::init_syn::Output,
 ) -> OResult<Output> {
     // Wait to read an InitAck
-    let mut messages = link.read_transport_message().await.map_err(|e| (e, None))?;
+    let mut messages = link
+        .read_transport_message()
+        .await
+        .map_err(|e| (e, Some(tmsg::close_reason::INVALID)))?;
     if messages.len() != 1 {
         return Err((
             zerror!(
@@ -60,26 +69,25 @@ pub(super) async fn recv(
     let init_ack = match msg.body {
         TransportBody::InitAck(init_ack) => init_ack,
         TransportBody::Close(Close { reason, .. }) => {
-            return Err((
-                zerror!(
-                    "Received a close message (reason {}) in response to an InitSyn on: {}",
-                    reason,
-                    link,
-                )
-                .into(),
-                None,
-            ));
+            let e = zerror!(
+                "Received a close message (reason {}) in response to an InitSyn on: {}",
+                tmsg::close_reason_to_str(reason),
+                link,
+            );
+            match reason {
+                tmsg::close_reason::MAX_LINKS => log::debug!("{}", e),
+                _ => log::error!("{}", e),
+            }
+            return Err((e.into(), None));
         }
         _ => {
-            return Err((
-                zerror!(
-                    "Received an invalid message in response to an InitSyn on {}: {:?}",
-                    link,
-                    msg.body
-                )
-                .into(),
-                Some(tmsg::close_reason::INVALID),
-            ));
+            let e = zerror!(
+                "Received an invalid message in response to an InitSyn on {}: {:?}",
+                link,
+                msg.body
+            );
+            log::error!("{}", e);
+            return Err((e.into(), Some(tmsg::close_reason::INVALID)));
         }
     };
 
@@ -102,22 +110,23 @@ pub(super) async fn recv(
     };
 
     // Store the peer id associate do this link
-    auth_link.peer_id = Some(init_ack.pid);
+    auth_link.peer_id = Some(init_ack.zid);
 
     let mut init_ack_properties = match msg.attachment.take() {
-        Some(att) => {
-            properties_from_attachment(att).map_err(|e| (e, Some(tmsg::close_reason::INVALID)))?
-        }
+        Some(att) => EstablishmentProperties::try_from(&att)
+            .map_err(|e| (e, Some(tmsg::close_reason::INVALID)))?,
         None => EstablishmentProperties::new(),
     };
 
+    #[allow(unused_mut)]
     let mut is_shm = false;
     let mut ps_attachment = EstablishmentProperties::new();
     for pa in zasyncread!(manager.state.unicast.peer_authenticator).iter() {
+        #[allow(unused_mut)]
         let mut att = pa
             .handle_init_ack(
                 auth_link,
-                &init_ack.pid,
+                &init_ack.zid,
                 sn_resolution,
                 init_ack_properties.remove(pa.id().into()).map(|x| x.value),
             )
@@ -132,7 +141,7 @@ pub(super) async fn recv(
                     Ok(att)
                 }
                 Err(e) => {
-                    if e.is::<zenoh_core::zresult::ShmError>() {
+                    if e.is::<zenoh_result::ShmError>() {
                         is_shm = false;
                         Ok(None)
                     } else {
@@ -149,18 +158,26 @@ pub(super) async fn recv(
                     key: pa.id().into(),
                     value: att,
                 })
-                .map_err(|e| (e, None))?;
+                .map_err(|e| (e, Some(tmsg::close_reason::UNSUPPORTED)))?;
         }
     }
 
+    let open_syn_attachment = if ps_attachment.is_empty() {
+        None
+    } else {
+        let att = Attachment::try_from(&ps_attachment)
+            .map_err(|e| (e, Some(tmsg::close_reason::INVALID)))?;
+        Some(att)
+    };
+
     let output = Output {
-        pid: init_ack.pid,
+        zid: init_ack.zid,
         whatami: init_ack.whatami,
         sn_resolution,
         is_qos: init_ack.is_qos,
         is_shm,
         cookie: init_ack.cookie,
-        open_syn_attachment: attachment_from_properties(&ps_attachment).ok(),
+        open_syn_attachment,
     };
     Ok(output)
 }

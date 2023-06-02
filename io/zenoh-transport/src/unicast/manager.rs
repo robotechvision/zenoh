@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -13,7 +13,6 @@
 //
 use crate::unicast::{
     establishment::authenticator::*,
-    protocol::core::PeerId,
     transport::{TransportUnicastConfig, TransportUnicastInner},
     TransportConfigUnicast, TransportUnicast,
 };
@@ -26,12 +25,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use zenoh_cfg_properties::config::*;
 use zenoh_config::Config;
-use zenoh_core::{
-    bail, zasynclock, zasyncread, zasyncwrite, zerror, zlock, zparse, Result as ZResult,
-};
+use zenoh_core::{zasynclock, zasyncread, zasyncwrite, zlock, zparse};
 use zenoh_link::*;
-use zenoh_protocol::proto::tmsg;
-use zenoh_protocol_core::locators::LocatorProtocol;
+use zenoh_protocol::{
+    core::{endpoint::Protocol, ZenohId},
+    transport::tmsg,
+};
+use zenoh_result::{bail, zerror, ZResult};
 
 /*************************************/
 /*         TRANSPORT CONFIG          */
@@ -46,6 +46,8 @@ pub struct TransportManagerConfigUnicast {
     pub is_qos: bool,
     #[cfg(feature = "shared-memory")]
     pub is_shm: bool,
+    #[cfg(all(feature = "unstable", feature = "transport_compression"))]
+    pub is_compressed: bool,
 }
 
 pub struct TransportManagerStateUnicast {
@@ -58,7 +60,7 @@ pub struct TransportManagerStateUnicast {
     // Established listeners
     pub(super) protocols: Arc<Mutex<HashMap<String, LinkManagerUnicast>>>,
     // Established transports
-    pub(super) transports: Arc<Mutex<HashMap<PeerId, Arc<TransportUnicastInner>>>>,
+    pub(super) transports: Arc<Mutex<HashMap<ZenohId, Arc<TransportUnicastInner>>>>,
 }
 
 pub struct TransportManagerParamsUnicast {
@@ -81,6 +83,8 @@ pub struct TransportManagerBuilderUnicast {
     pub(super) is_qos: bool,
     #[cfg(feature = "shared-memory")]
     pub(super) is_shm: bool,
+    #[cfg(all(feature = "unstable", feature = "transport_compression"))]
+    pub(super) is_compressed: bool,
     pub(super) peer_authenticator: HashSet<PeerAuthenticator>,
     pub(super) link_authenticator: HashSet<LinkAuthenticator>,
 }
@@ -137,6 +141,12 @@ impl TransportManagerBuilderUnicast {
         self
     }
 
+    #[cfg(all(feature = "unstable", feature = "transport_compression"))]
+    pub fn compression(mut self, is_compressed: bool) -> Self {
+        self.is_compressed = is_compressed;
+        self
+    }
+
     pub async fn from_config(mut self, config: &Config) -> ZResult<TransportManagerBuilderUnicast> {
         self = self.lease(Duration::from_millis(
             config.transport().link().tx().lease().unwrap(),
@@ -153,6 +163,11 @@ impl TransportManagerBuilderUnicast {
         #[cfg(feature = "shared-memory")]
         {
             self = self.shm(*config.transport().shared_memory().enabled());
+        }
+
+        #[cfg(all(feature = "unstable", feature = "transport_compression"))]
+        {
+            self = self.compression(*config.transport().link().compression().enabled());
         }
         self = self.peer_authenticator(PeerAuthenticator::from_config(config).await?);
         self = self.link_authenticator(LinkAuthenticator::from_config(config).await?);
@@ -174,9 +189,11 @@ impl TransportManagerBuilderUnicast {
             is_qos: self.is_qos,
             #[cfg(feature = "shared-memory")]
             is_shm: self.is_shm,
+            #[cfg(all(feature = "unstable", feature = "transport_compression"))]
+            is_compressed: self.is_compressed,
         };
 
-        // Enable pubkey authentication by default to avoid PeerId spoofing
+        // Enable pubkey authentication by default to avoid ZenohId spoofing
         #[cfg(feature = "auth_pubkey")]
         if !self
             .peer_authenticator
@@ -224,6 +241,8 @@ impl Default for TransportManagerBuilderUnicast {
             is_qos: zparse!(ZN_QOS_DEFAULT).unwrap(),
             #[cfg(feature = "shared-memory")]
             is_shm: zparse!(ZN_SHM_DEFAULT).unwrap(),
+            #[cfg(all(feature = "unstable", feature = "transport_compression"))]
+            is_compressed: false,
             peer_authenticator: HashSet::new(),
             link_authenticator: HashSet::new(),
         }
@@ -275,20 +294,22 @@ impl TransportManager {
     /*************************************/
     /*            LINK MANAGER           */
     /*************************************/
-    fn new_link_manager_unicast(&self, protocol: &str) -> ZResult<LinkManagerUnicast> {
+    fn new_link_manager_unicast(&self, protocol: &Protocol) -> ZResult<LinkManagerUnicast> {
         let mut w_guard = zlock!(self.state.unicast.protocols);
-        if let Some(lm) = w_guard.get(protocol) {
+        if let Some(lm) = w_guard.get(protocol.as_str()) {
             Ok(lm.clone())
         } else {
-            let lm =
-                LinkManagerBuilderUnicast::make(self.new_unicast_link_sender.clone(), protocol)?;
-            w_guard.insert(protocol.to_owned(), lm.clone());
+            let lm = LinkManagerBuilderUnicast::make(
+                self.new_unicast_link_sender.clone(),
+                protocol.as_str(),
+            )?;
+            w_guard.insert(protocol.to_string(), lm.clone());
             Ok(lm)
         }
     }
 
-    fn get_link_manager_unicast(&self, protocol: &LocatorProtocol) -> ZResult<LinkManagerUnicast> {
-        match zlock!(self.state.unicast.protocols).get(protocol) {
+    fn get_link_manager_unicast(&self, protocol: &Protocol) -> ZResult<LinkManagerUnicast> {
+        match zlock!(self.state.unicast.protocols).get(protocol.as_str()) {
             Some(manager) => Ok(manager.clone()),
             None => bail!(
                 "Can not get the link manager for protocol ({}) because it has not been found",
@@ -297,8 +318,8 @@ impl TransportManager {
         }
     }
 
-    fn del_link_manager_unicast(&self, protocol: &LocatorProtocol) -> ZResult<()> {
-        match zlock!(self.state.unicast.protocols).remove(protocol) {
+    fn del_link_manager_unicast(&self, protocol: &Protocol) -> ZResult<()> {
+        match zlock!(self.state.unicast.protocols).remove(protocol.as_str()) {
             Some(_) => Ok(()),
             None => bail!(
                 "Can not delete the link manager for protocol ({}) because it has not been found.",
@@ -311,19 +332,19 @@ impl TransportManager {
     /*              LISTENER             */
     /*************************************/
     pub async fn add_listener_unicast(&self, mut endpoint: EndPoint) -> ZResult<Locator> {
-        let manager = self.new_link_manager_unicast(endpoint.locator.protocol())?;
+        let manager = self.new_link_manager_unicast(&endpoint.protocol())?;
         // Fill and merge the endpoint configuration
-        if let Some(config) = self.config.endpoint.get(endpoint.locator.protocol()) {
-            endpoint.extend_configuration(config.iter().map(|(k, v)| (k.clone(), v.clone())));
+        if let Some(config) = self.config.endpoint.get(endpoint.protocol().as_str()) {
+            endpoint.config_mut().extend(config.iter())?;
         };
         manager.new_listener(endpoint).await
     }
 
     pub async fn del_listener_unicast(&self, endpoint: &EndPoint) -> ZResult<()> {
-        let lm = self.get_link_manager_unicast(endpoint.locator.protocol())?;
+        let lm = self.get_link_manager_unicast(&endpoint.protocol())?;
         lm.del_listener(endpoint).await?;
         if lm.get_listeners().is_empty() {
-            self.del_link_manager_unicast(endpoint.locator.protocol())?;
+            self.del_link_manager_unicast(&endpoint.protocol())?;
         }
         Ok(())
     }
@@ -418,7 +439,7 @@ impl TransportManager {
                 // Create the transport
                 let stc = TransportUnicastConfig {
                     manager: self.clone(),
-                    pid: config.peer,
+                    zid: config.peer,
                     whatami: config.whatami,
                     sn_resolution: config.sn_resolution,
                     initial_sn_tx: config.initial_sn_tx,
@@ -452,7 +473,7 @@ impl TransportManager {
     ) -> ZResult<TransportUnicast> {
         if self
             .locator_inspector
-            .is_multicast(&endpoint.locator)
+            .is_multicast(&endpoint.to_locator())
             .await?
         {
             bail!(
@@ -462,10 +483,10 @@ impl TransportManager {
         }
 
         // Automatically create a new link manager for the protocol if it does not exist
-        let manager = self.new_link_manager_unicast(endpoint.locator.protocol())?;
+        let manager = self.new_link_manager_unicast(&endpoint.protocol())?;
         // Fill and merge the endpoint configuration
-        if let Some(config) = self.config.endpoint.get(endpoint.locator.protocol()) {
-            endpoint.extend_configuration(config.iter().map(|(k, v)| (k.clone(), v.clone())));
+        if let Some(config) = self.config.endpoint.get(endpoint.protocol().as_str()) {
+            endpoint.config_mut().extend(config.iter())?;
         };
 
         // Create a new link associated by calling the Link Manager
@@ -479,7 +500,7 @@ impl TransportManager {
         super::establishment::open::open_link(&link, self, &mut auth_link).await
     }
 
-    pub fn get_transport_unicast(&self, peer: &PeerId) -> Option<TransportUnicast> {
+    pub fn get_transport_unicast(&self, peer: &ZenohId) -> Option<TransportUnicast> {
         zlock!(self.state.unicast.transports)
             .get(peer)
             .map(|t| t.into())
@@ -492,7 +513,7 @@ impl TransportManager {
             .collect()
     }
 
-    pub(super) async fn del_transport_unicast(&self, peer: &PeerId) -> ZResult<()> {
+    pub(super) async fn del_transport_unicast(&self, peer: &ZenohId) -> ZResult<()> {
         let _ = zlock!(self.state.unicast.transports)
             .remove(peer)
             .ok_or_else(|| {
@@ -526,16 +547,16 @@ impl TransportManager {
         *guard += 1;
         drop(guard);
 
-        let mut peer_id: Option<PeerId> = None;
+        let mut peer_id: Option<ZenohId> = None;
         let peer_link = Link::from(&link);
         for la in zasyncread!(self.state.unicast.link_authenticator).iter() {
             let res = la.handle_new_link(&peer_link).await;
             match res {
-                Ok(pid) => {
-                    // Check that all the peer authenticators, eventually return the same PeerId
-                    if let Some(pid1) = peer_id.as_ref() {
-                        if let Some(pid2) = pid.as_ref() {
-                            if pid1 != pid2 {
+                Ok(zid) => {
+                    // Check that all the peer authenticators, eventually return the same ZenohId
+                    if let Some(zid1) = peer_id.as_ref() {
+                        if let Some(zid2) = zid.as_ref() {
+                            if zid1 != zid2 {
                                 log::debug!("Ambigous PeerID identification for link: {}", link);
                                 let _ = link.close().await;
                                 let mut guard = zasynclock!(self.state.unicast.incoming);
@@ -544,7 +565,7 @@ impl TransportManager {
                             }
                         }
                     } else {
-                        peer_id = pid;
+                        peer_id = zid;
                     }
                 }
                 Err(e) => {
@@ -565,19 +586,13 @@ impl TransportManager {
                 peer_id,
             };
 
-            let res = super::establishment::accept::accept_link(&link, &c_manager, &mut auth_link)
-                .timeout(c_manager.config.unicast.accept_timeout)
-                .await;
-            match res {
-                Ok(res) => {
-                    if let Err(e) = res {
-                        log::debug!("{}", e);
-                    }
-                }
-                Err(e) => {
-                    log::debug!("{}", e);
-                    let _ = link.close().await;
-                }
+            if let Err(e) =
+                super::establishment::accept::accept_link(&link, &c_manager, &mut auth_link)
+                    .timeout(c_manager.config.unicast.accept_timeout)
+                    .await
+            {
+                log::debug!("{}", e);
+                let _ = link.close().await;
             }
             let mut guard = zasynclock!(c_manager.state.unicast.incoming);
             *guard -= 1;

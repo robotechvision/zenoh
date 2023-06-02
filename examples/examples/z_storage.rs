@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -20,37 +20,40 @@ use futures::select;
 use std::collections::HashMap;
 use std::time::Duration;
 use zenoh::config::Config;
-use zenoh::prelude::*;
-use zenoh::queryable::STORAGE;
-use zenoh::utils::key_expr;
+use zenoh::prelude::r#async::*;
 
 #[async_std::main]
 async fn main() {
     // initiate logging
     env_logger::init();
 
-    let (config, key_expr) = parse_args();
+    let (config, key_expr, complete) = parse_args();
 
     let mut stored: HashMap<String, Sample> = HashMap::new();
 
     println!("Opening session...");
-    let session = zenoh::open(config).await.unwrap();
+    let session = zenoh::open(config).res().await.unwrap();
 
-    println!("Creating Subscriber on '{}'...", key_expr);
-    let mut subscriber = session.subscribe(&key_expr).await.unwrap();
+    println!("Declaring Subscriber on '{key_expr}'...");
+    let subscriber = session.declare_subscriber(&key_expr).res().await.unwrap();
 
-    println!("Creating Queryable on '{}'...", key_expr);
-    let mut queryable = session.queryable(&key_expr).kind(STORAGE).await.unwrap();
+    println!("Declaring Queryable on '{key_expr}'...");
+    let queryable = session
+        .declare_queryable(&key_expr)
+        .complete(complete)
+        .res()
+        .await
+        .unwrap();
 
     println!("Enter 'q' to quit...");
     let mut stdin = async_std::io::stdin();
     let mut input = [0u8];
     loop {
         select!(
-            sample = subscriber.next() => {
+            sample = subscriber.recv_async() => {
                 let sample = sample.unwrap();
                 println!(">> [Subscriber] Received {} ('{}': '{}')",
-                    sample.kind, sample.key_expr.as_str(), String::from_utf8_lossy(&sample.value.payload.contiguous()));
+                    sample.kind, sample.key_expr.as_str(), sample.value);
                 if sample.kind == SampleKind::Delete {
                     stored.remove(&sample.key_expr.to_string());
                 } else {
@@ -58,12 +61,12 @@ async fn main() {
                 }
             },
 
-            query = queryable.next() => {
+            query = queryable.recv_async() => {
                 let query = query.unwrap();
                 println!(">> [Queryable ] Received Query '{}'", query.selector());
                 for (stored_name, sample) in stored.iter() {
-                    if key_expr::intersect(query.selector().key_selector.as_str(), stored_name) {
-                        query.reply(sample.clone());
+                    if query.selector().key_expr.intersects(unsafe {keyexpr::from_str_unchecked(stored_name)}) {
+                        query.reply(Ok(sample.clone())).res().await.unwrap();
                     }
                 }
             },
@@ -79,11 +82,11 @@ async fn main() {
     }
 }
 
-fn parse_args() -> (Config, String) {
+fn parse_args() -> (Config, String, bool) {
     let args = App::new("zenoh storage example")
         .arg(
             Arg::from_usage("-m, --mode=[MODE]  'The zenoh session mode (peer by default).")
-                .possible_values(&["peer", "client"]),
+                .possible_values(["peer", "client"]),
         )
         .arg(Arg::from_usage(
             "-e, --connect=[ENDPOINT]...   'Endpoints to connect to.'",
@@ -93,13 +96,16 @@ fn parse_args() -> (Config, String) {
         ))
         .arg(
             Arg::from_usage("-k, --key=[KEYEXPR] 'The selection of resources to store'")
-                .default_value("/demo/example/**"),
+                .default_value("demo/example/**"),
         )
         .arg(Arg::from_usage(
             "-c, --config=[FILE]      'A configuration file.'",
         ))
         .arg(Arg::from_usage(
             "--no-multicast-scouting 'Disable the multicast-based scouting mechanism.'",
+        ))
+        .arg(Arg::from_usage(
+            "--complete 'Declare the storage as complete w.r.t. the key expression.'",
         ))
         .get_matches();
 
@@ -128,6 +134,7 @@ fn parse_args() -> (Config, String) {
     }
 
     let key_expr = args.value_of("key").unwrap().to_string();
+    let complete = args.is_present("complete");
 
-    (config, key_expr)
+    (config, key_expr, complete)
 }

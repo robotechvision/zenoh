@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,13 +11,13 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-#[cfg(feature = "stats")]
-use super::protocol::proto::ZenohBody;
-use super::protocol::proto::ZenohMessage;
 use super::transport::TransportUnicastInner;
 #[cfg(feature = "stats")]
 use zenoh_buffers::SplitBuffer;
 use zenoh_core::zread;
+#[cfg(feature = "stats")]
+use zenoh_protocol::zenoh::ZenohBody;
+use zenoh_protocol::zenoh::ZenohMessage;
 
 impl TransportUnicastInner {
     fn schedule_on_link(&self, msg: ZenohMessage) -> bool {
@@ -28,28 +28,30 @@ impl TransportUnicastInner {
                 // block for fairly long time
                 let pl = $pipeline.clone();
                 drop($guard);
+                log::trace!("Scheduled: {:?}", $msg);
                 return pl.push_zenoh_message($msg);
             };
         }
 
         let guard = zread!(self.links);
         // First try to find the best match between msg and link reliability
-        for tl in guard.iter() {
-            if let Some(pipeline) = tl.pipeline.as_ref() {
-                if msg.is_reliable() && tl.link.is_reliable() {
-                    zpush!(guard, pipeline, msg);
+        if let Some(pl) = guard
+            .iter()
+            .filter_map(|tl| {
+                if msg.is_reliable() == tl.link.is_reliable() {
+                    tl.pipeline.as_ref()
+                } else {
+                    None
                 }
-                if !msg.is_reliable() && !tl.link.is_reliable() {
-                    zpush!(guard, pipeline, msg);
-                }
-            }
+            })
+            .next()
+        {
+            zpush!(guard, pl, msg);
         }
 
         // No best match found, take the first available link
-        for tl in guard.iter() {
-            if let Some(pipeline) = tl.pipeline.as_ref() {
-                zpush!(guard, pipeline, msg);
-            }
+        if let Some(pl) = guard.iter().filter_map(|tl| tl.pipeline.as_ref()).next() {
+            zpush!(guard, pl, msg);
         }
 
         // No Link found

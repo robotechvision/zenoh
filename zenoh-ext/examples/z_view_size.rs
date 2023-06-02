@@ -1,7 +1,21 @@
+//
+// Copyright (c) 2023 ZettaScale Technology
+//
+// This program and the accompanying materials are made available under the
+// terms of the Eclipse Public License 2.0 which is available at
+// http://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
+// which is available at https://www.apache.org/licenses/LICENSE-2.0.
+//
+// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
+//
+// Contributors:
+//   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
+//
 use clap::{App, Arg};
 use std::sync::Arc;
 use std::time::Duration;
 use zenoh::config::Config;
+use zenoh::prelude::r#async::*;
 use zenoh_ext::group::*;
 
 #[async_std::main]
@@ -10,25 +24,28 @@ async fn main() {
 
     let (config, group_name, id, size, timeout) = parse_args();
 
-    let z = Arc::new(zenoh::open(config).await.unwrap());
-    let member_id = id.unwrap_or(z.id().await);
-    let member = Member::new(&member_id).lease(Duration::from_secs(3));
+    let z = Arc::new(zenoh::open(config).res().await.unwrap());
+    let member_id = id.unwrap_or_else(|| z.zid().to_string());
+    let member = Member::new(member_id.as_str())
+        .unwrap()
+        .lease(Duration::from_secs(3));
 
-    let group = Group::join(z.clone(), &group_name, member).await;
+    let group = Group::join(z.clone(), group_name.as_str(), member)
+        .await
+        .unwrap();
     println!(
-        "Member {} waiting for {} members in group {} for {} seconds...",
-        member_id, size, group_name, timeout
+        "Member {member_id} waiting for {size} members in group {group_name} for {timeout} seconds..."
     );
     if group
         .wait_for_view_size(size, Duration::from_secs(timeout))
         .await
     {
-        println!("Established view size of {} with members:", size);
+        println!("Established view size of {size} with members:");
         for m in group.view().await {
             println!(" - {}", m.id());
         }
     } else {
-        println!("Failed to establish view size of {}", size);
+        println!("Failed to establish view size of {size}");
     }
 }
 
@@ -36,7 +53,7 @@ fn parse_args() -> (Config, String, Option<String>, usize, u64) {
     let args = App::new("zenoh-ext group view size example")
         .arg(
             Arg::from_usage("-m, --mode=[MODE] 'The zenoh session mode (peer by default).")
-                .possible_values(&["peer", "client"]),
+                .possible_values(["peer", "client"]),
         )
         .arg(Arg::from_usage(
             "-e, --connect=[ENDPOINT]...  'Endpoints to connect to.'",
@@ -51,7 +68,7 @@ fn parse_args() -> (Config, String, Option<String>, usize, u64) {
             "-g, --group=[STRING] 'The group name'",
         ).default_value("zgroup"))
         .arg(Arg::from_usage(
-            "-i, --id=[STRING] 'The group member id (default is the zenoh UUID)'",
+            "-i, --id=[STRING] 'The group member id (default is the zenoh ID)'",
         ))
         .arg(Arg::from_usage(
             "-s, --size=[INT] 'The expected group size. The example will wait for the group to reach this size'",
@@ -75,7 +92,7 @@ fn parse_args() -> (Config, String, Option<String>, usize, u64) {
             .endpoints
             .extend(values.map(|v| v.parse().unwrap()))
     }
-    if let Some(values) = args.values_of("listeners") {
+    if let Some(values) = args.values_of("listen") {
         config
             .listen
             .endpoints

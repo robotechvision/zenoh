@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,6 +11,14 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
+
+//! ⚠️ WARNING ⚠️
+//!
+//! This crate is depecrated and it will be completely removed in the future.
+//!
+//! This crate is intended for Zenoh's internal use.
+//!
+//! [Click here for Zenoh's documentation](../zenoh/index.html)
 pub mod config;
 
 use std::collections::HashMap;
@@ -25,7 +33,8 @@ pub trait KeyTranscoder {
 }
 
 /// A set of Key/Value (`u64`/`String`) pairs.
-#[derive(PartialEq)]
+#[non_exhaustive]
+#[derive(PartialEq, Eq)]
 pub struct IntKeyProperties<T>(pub HashMap<u64, String>, PhantomData<T>)
 where
     T: KeyTranscoder;
@@ -152,7 +161,8 @@ const COMMENT_PREFIX: char = '#';
 ///
 /// It can be parsed from a String, using `;` or `<newline>` as separator between each properties
 /// and `=` as separator between a key and its value. Keys and values are trimed.
-#[derive(Clone, PartialEq, Default)]
+#[non_exhaustive]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct Properties(pub HashMap<String, String>);
 
 impl Deref for Properties {
@@ -180,13 +190,13 @@ impl fmt::Display for Properties {
         let mut it = self.0.iter();
         if let Some((k, v)) = it.next() {
             if v.is_empty() {
-                write!(f, "{}", k)?
+                write!(f, "{k}")?
             } else {
                 write!(f, "{}{}{}", k, KV_SEP[0], v)?
             }
             for (k, v) in it {
                 if v.is_empty() {
-                    write!(f, "{}{}", DEFAULT_PROP_SEP, k)?
+                    write!(f, "{DEFAULT_PROP_SEP}{k}")?
                 } else {
                     write!(f, "{}{}{}{}", DEFAULT_PROP_SEP, k, KV_SEP[0], v)?
                 }
@@ -206,7 +216,7 @@ impl fmt::Debug for Properties {
         let mut it = self.0.iter();
         if let Some((k, v)) = it.next() {
             if v.is_empty() {
-                write!(f, "{}", k)?
+                write!(f, "{k}")?
             } else if k.contains("password") {
                 write!(f, "{}{}*****", k, KV_SEP[0])?
             } else {
@@ -214,7 +224,7 @@ impl fmt::Debug for Properties {
             }
             for (k, v) in it {
                 if v.is_empty() {
-                    write!(f, "{}{}", DEFAULT_PROP_SEP, k)?
+                    write!(f, "{DEFAULT_PROP_SEP}{k}")?
                 } else if k.contains("password") {
                     write!(f, "{}{}{}*****", DEFAULT_PROP_SEP, k, KV_SEP[0])?
                 } else {
@@ -291,7 +301,7 @@ impl From<&[(&str, &str)]> for Properties {
 }
 
 impl TryFrom<&std::path::Path> for Properties {
-    type Error = zenoh_core::Error;
+    type Error = zenoh_result::Error;
     fn try_from(p: &std::path::Path) -> Result<Self, Self::Error> {
         Ok(Self::from(std::fs::read_to_string(p)?))
     }
@@ -334,7 +344,9 @@ mod tests {
     }
 }
 
-pub struct DummyTranscoder();
+#[non_exhaustive]
+pub struct DummyTranscoder;
+
 impl KeyTranscoder for DummyTranscoder {
     fn encode(_key: &str) -> Option<u64> {
         None

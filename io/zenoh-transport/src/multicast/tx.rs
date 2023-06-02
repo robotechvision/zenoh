@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,12 +11,13 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-#[cfg(feature = "stats")]
-use super::protocol::proto::ZenohBody;
-use super::protocol::proto::ZenohMessage;
 use super::transport::TransportMulticastInner;
 use zenoh_core::zread;
+#[cfg(feature = "stats")]
+use zenoh_protocol::zenoh::ZenohBody;
+use zenoh_protocol::zenoh::ZenohMessage;
 
+//noinspection ALL
 impl TransportMulticastInner {
     fn schedule_on_link(&self, msg: ZenohMessage) -> bool {
         macro_rules! zpush {
@@ -33,8 +34,8 @@ impl TransportMulticastInner {
         let guard = zread!(self.link);
         match guard.as_ref() {
             Some(l) => {
-                if let Some(pipeline) = l.pipeline.as_ref() {
-                    zpush!(guard, pipeline, msg);
+                if let Some(pl) = l.pipeline.as_ref() {
+                    zpush!(guard, pl, msg);
                 }
             }
             None => {

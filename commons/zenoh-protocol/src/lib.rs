@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,7 +11,18 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-#[deprecated = "This module is now a separate crate. Use the crate directly for shorter compile-times"]
-pub use zenoh_protocol_core as core;
-pub mod io;
-pub mod proto;
+
+//! ⚠️ WARNING ⚠️
+//!
+//! This crate is intended for Zenoh's internal use.
+//!
+//! [Click here for Zenoh's documentation](../zenoh/index.html)
+#![cfg_attr(not(feature = "std"), no_std)]
+extern crate alloc;
+
+pub mod common;
+pub mod core;
+pub mod defaults;
+pub mod scouting;
+pub mod transport;
+pub mod zenoh;

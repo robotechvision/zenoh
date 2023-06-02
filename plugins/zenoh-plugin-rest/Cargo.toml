@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2022 ZettaScale Technology
+# Copyright (c) 2023 ZettaScale Technology
 #
 # This program and the accompanying materials are made available under the
 # terms of the Eclipse Public License 2.0 which is available at
@@ -12,49 +12,48 @@
 #   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 #
 [package]
+rust-version = { workspace = true }
 name = "zenoh-plugin-rest"
-version = "0.6.0-dev.0"
-repository = "https://github.com/eclipse-zenoh/zenoh"
-homepage = "http://zenoh.io"
-authors = [
-    "kydos <angelo@icorsaro.net>",
-    "Julien Enoch <julien@enoch.fr>",
-    "Olivier Hécart <olivier.hecart@zettascale.tech>",
-    "Luca Cominardi <luca.cominardi@zettascale.tech>",
-    "Pierre Avital <pierre.avital@zettascale.tech>",
-]
-edition = "2018"
-license = " EPL-2.0 OR Apache-2.0"
-categories = ["network-programming"]
+version = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+categories = ["network-programming", "web-programming::http-server"]
 description = "The zenoh REST plugin"
 
 [features]
-no_mangle = ["zenoh-plugin-trait/no_mangle"]
 default = ["no_mangle"]
-
+no_mangle = ["zenoh-plugin-trait/no_mangle"]
 
 [lib]
-name = "zplugin_rest"
+name = "zenoh_plugin_rest"
 crate-type = ["cdylib", "rlib"]
 
-
 [dependencies]
-async-std = "=1.11.0"
-base64 = "0.13.0"
-clap = "2.33.3"
-env_logger = "0.9.0"
-flume = "0.10.5"
-futures = "0.3.12"
-git-version = "0.3.5"
-http-types = "2.10.0"
-log = "0.4"
-serde = "1.0"
-serde_json = "1.0"
-tide = "0.16.0"
-zenoh = { path = "../../zenoh" }
-zenoh-util = { path = "../../commons/zenoh-util/" }
-zenoh-core = { path = "../../commons/zenoh-core/" }
-zenoh-plugin-trait = { path = "../zenoh-plugin-trait", default-features = false }
+anyhow = { workspace = true, features = ["default"] }
+async-std = { workspace = true, features = ["default"] }
+base64 = { workspace = true }
+clap = { workspace = true }
+env_logger = { workspace = true }
+flume = { workspace = true }
+futures = { workspace = true }
+git-version = { workspace = true }
+http-types = { workspace = true }
+lazy_static = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true, features = ["default"] }
+serde_json = { workspace = true }
+tide = { workspace = true }
+zenoh = { workspace = true, features = ["unstable"] }
+zenoh-cfg-properties = { workspace = true }
+zenoh-plugin-trait = { workspace = true }
+zenoh-result = { workspace = true }
+zenoh-util = { workspace = true }
+
+[build-dependencies]
+rustc_version = { workspace = true }
 
 [[example]]
 name = "z_serve_sse"
@@ -66,4 +65,4 @@ maintainer = "zenoh-dev@eclipse.org"
 copyright = "2022 ZettaScale Technology"
 section = "net"
 license-file = ["../../LICENSE", "0"]
-depends = "zenohd (=0.6.0~dev.0)"
+depends = "zenohd (=0.7.0-rc)"

@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2022 ZettaScale Technology
+# Copyright (c) 2023 ZettaScale Technology
 #
 # This program and the accompanying materials are made available under the
 # terms of the Eclipse Public License 2.0 which is available at
@@ -12,39 +12,41 @@
 #   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 #
 [package]
+rust-version = { workspace = true }
 name = "zenoh-ext"
-version = "0.6.0-dev.0"
-repository = "https://github.com/eclipse-zenoh/zenoh"
-homepage = "http://zenoh.io"
+version = { workspace = true }
+repository = { workspace = true }
+homepage = { workspace = true }
 authors = ["kydos <angelo@icorsaro.net>", "Julien Enoch <julien@enoch.fr>"]
-edition = "2018"
-license = " EPL-2.0 OR Apache-2.0"
-categories = ["network-programming"]
+edition = { workspace = true }
+license = { workspace = true }
+categories = { workspace = true }
 description = "Zenoh: extensions to the client API."
 
 [badges]
 maintenance = { status = "actively-developed" }
 
+[features]
+unstable = []
+default = []
+
 [dependencies]
-async-std = { version = "=1.11.0", default-features = false, features = [
-    "attributes",
-    "unstable",
-] }
-bincode = "1.3.3"
-env_logger = "0.9.0"
-flume = "0.10.7"
-futures = "0.3.12"
-log = "0.4"
-serde = "1.0.126"
-zenoh = { path = "../zenoh" }
-zenoh-util = { path = "../commons/zenoh-util" }
-zenoh-sync = { path = "../commons/zenoh-sync" }
-zenoh-core = { path = "../commons/zenoh-core/" }
+async-std = { workspace = true, features = ["attributes", "unstable"] }
+bincode = { workspace = true }
+env_logger = { workspace = true }
+flume = { workspace = true }
+futures = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true, features = ["default"] }
+zenoh = { workspace = true, features = ["unstable"] }
+zenoh-core = { workspace = true }
+zenoh-macros = { workspace = true }
+zenoh-result = { workspace = true }
+zenoh-sync = { workspace = true }
+zenoh-util = { workspace = true }
 
 [dev-dependencies]
-clap = "2.33.3"
-env_logger = "0.9.0"
-
+clap = { workspace = true }
 
 [[example]]
 name = "z_query_sub"
@@ -61,3 +63,6 @@ path = "examples/z_member.rs"
 [[example]]
 name = "z_view_size"
 path = "examples/z_view_size.rs"
+
+[package.metadata.docs.rs]
+features = ["unstable"]

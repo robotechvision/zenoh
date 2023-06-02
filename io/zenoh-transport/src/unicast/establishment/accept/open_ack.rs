@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -15,8 +15,11 @@ use super::super::AuthenticatedPeerLink;
 use super::AResult;
 use crate::TransportManager;
 use zenoh_link::LinkUnicast;
-use zenoh_protocol::core::ZInt;
-use zenoh_protocol::proto::{Attachment, TransportMessage};
+use zenoh_protocol::{
+    common::Attachment,
+    core::ZInt,
+    transport::{tmsg, TransportMessage},
+};
 
 /*************************************/
 /*             ACCEPT                */
@@ -34,17 +37,17 @@ pub(super) async fn send(
     input: Input,
 ) -> AResult<()> {
     // Build OpenAck message
-    let mut message = TransportMessage::make_open_ack(
+    let message = TransportMessage::make_open_ack(
         manager.config.unicast.lease,
         input.initial_sn,
         input.attachment,
     );
 
-    // Send the message on the link
+    // Send the message on the
     let _ = link
-        .write_transport_message(&mut message)
+        .write_transport_message(&message)
         .await
-        .map_err(|e| (e, None))?;
+        .map_err(|e| (e, Some(tmsg::close_reason::GENERIC)))?;
 
     Ok(())
 }

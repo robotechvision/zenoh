@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -15,7 +15,7 @@ use serde::de::{Unexpected, Visitor};
 use serde::{de, Deserialize, Deserializer};
 use std::fmt;
 
-const DEFAULT_HTTP_INTERFACE: &str = "0.0.0.0";
+const DEFAULT_HTTP_INTERFACE: &str = "[::]";
 
 #[derive(Deserialize, serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
@@ -52,7 +52,7 @@ impl<'de> Visitor<'de> for HttpPortVisitor {
     where
         E: de::Error,
     {
-        Ok(format!("{}:{}", DEFAULT_HTTP_INTERFACE, value))
+        Ok(format!("{DEFAULT_HTTP_INTERFACE}:{value}"))
     }
 
     fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -71,6 +71,6 @@ impl<'de> Visitor<'de> for HttpPortVisitor {
         if port.parse::<u32>().is_err() {
             return Err(E::invalid_value(Unexpected::Str(port), &self));
         }
-        Ok(format!("{}:{}", interface, port))
+        Ok(format!("{interface}:{port}"))
     }
 }

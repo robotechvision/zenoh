@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -11,7 +11,7 @@
 // Contributors:
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
-use super::Condition;
+use crate::Condition;
 use async_std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use zenoh_core::zasynclock;
@@ -108,14 +108,14 @@ mod tests {
         let ch = task::spawn(async move {
             for _ in 0..count {
                 let n = c_mvar.take().await;
-                print!("-{} ", n);
+                print!("-{n} ");
             }
         });
 
         let ph = task::spawn(async move {
             for i in 0..count {
                 mvar.put(i).await;
-                print!("+{} ", i);
+                print!("+{i} ");
             }
         });
 

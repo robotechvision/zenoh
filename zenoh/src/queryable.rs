@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -14,36 +14,45 @@
 
 //! Queryable primitives.
 
-use crate::net::transport::Primitives;
+use crate::handlers::{locked, DefaultHandler};
 use crate::prelude::*;
-use crate::sync::channel::Receiver;
-use crate::sync::ZFuture;
-use crate::Session;
+#[zenoh_macros::unstable]
+use crate::query::ReplyKeyExpr;
 use crate::SessionRef;
-use crate::API_QUERY_RECEPTION_CHANNEL_SIZE;
-use flume::r#async::RecvFut;
-use flume::{
-    bounded, Iter, RecvError, RecvTimeoutError, Sender, TryIter, TryRecvError, TrySendError,
-};
-use std::fmt;
-use std::pin::Pin;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use zenoh_protocol_core::QueryableInfo;
-use zenoh_sync::{derive_zfuture, zreceiver, Runnable};
+use crate::Undeclarable;
 
-pub use zenoh_protocol_core::queryable::*;
+use std::fmt;
+use std::future::Ready;
+use std::ops::Deref;
+use std::sync::Arc;
+use zenoh_core::{AsyncResolve, Resolvable, SyncResolve};
+use zenoh_protocol::core::WireExpr;
+use zenoh_result::ZResult;
+use zenoh_transport::Primitives;
+
+pub(crate) struct QueryInner {
+    /// The key expression of this Query.
+    pub(crate) key_expr: KeyExpr<'static>,
+    /// This Query's selector parameters.
+    pub(crate) parameters: String,
+    /// This Query's body.
+    pub(crate) value: Option<Value>,
+
+    pub(crate) qid: ZInt,
+    pub(crate) zid: ZenohId,
+    pub(crate) primitives: Arc<dyn Primitives>,
+}
+
+impl Drop for QueryInner {
+    fn drop(&mut self) {
+        self.primitives.send_reply_final(self.qid);
+    }
+}
 
 /// Structs received by a [`Queryable`](Queryable).
+#[derive(Clone)]
 pub struct Query {
-    /// The key_selector of this Query.
-    pub(crate) key_selector: KeyExpr<'static>,
-    /// The value_selector of this Query.
-    pub(crate) value_selector: String,
-    /// The sender to use to send replies to this query.
-    /// When this sender is dropped, the reply is finalized.
-    pub replies_sender: RepliesSender,
+    pub(crate) inner: Arc<QueryInner>,
 }
 
 impl Query {
@@ -51,324 +60,370 @@ impl Query {
     #[inline(always)]
     pub fn selector(&self) -> Selector<'_> {
         Selector {
-            key_selector: self.key_selector.clone(),
-            value_selector: (&self.value_selector).into(),
+            key_expr: self.inner.key_expr.clone(),
+            parameters: (&self.inner.parameters).into(),
         }
     }
 
     /// The key selector part of this Query.
     #[inline(always)]
-    pub fn key_selector(&self) -> &KeyExpr<'_> {
-        &self.key_selector
+    pub fn key_expr(&self) -> &KeyExpr<'static> {
+        &self.inner.key_expr
     }
 
-    /// The value selector part of this Query.
+    /// This Query's selector parameters.
     #[inline(always)]
-    pub fn value_selector(&self) -> &str {
-        &self.value_selector
+    pub fn parameters(&self) -> &str {
+        &self.inner.parameters
+    }
+
+    /// This Query's value.
+    #[inline(always)]
+    pub fn value(&self) -> Option<&Value> {
+        self.inner.value.as_ref()
     }
 
     /// Sends a reply to this Query.
+    ///
+    /// By default, queries only accept replies whose key expression intersects with the query's.
+    /// Unless the query has enabled disjoint replies (you can check this through [`Query::accepts_replies`]),
+    /// replying on a disjoint key expression will result in an error when resolving the reply.
     #[inline(always)]
-    pub fn reply(&'_ self, msg: Sample) {
-        self.replies_sender.send(msg);
+    pub fn reply(&self, result: Result<Sample, Value>) -> ReplyBuilder<'_> {
+        ReplyBuilder {
+            query: self,
+            result,
+        }
     }
 
-    /// Tries sending a reply to this Query.
-    #[inline(always)]
-    pub fn try_reply(&self, msg: Sample) -> core::result::Result<(), TrySendError<Sample>> {
-        self.replies_sender.try_send(msg)
+    /// Queries may or may not accept replies on key expressions that do not intersect with their own key expression.
+    /// This getter allows you to check whether or not a specific query does.
+    #[zenoh_macros::unstable]
+    pub fn accepts_replies(&self) -> ZResult<ReplyKeyExpr> {
+        self._accepts_any_replies().map(|any| {
+            if any {
+                ReplyKeyExpr::Any
+            } else {
+                ReplyKeyExpr::MatchingQuery
+            }
+        })
     }
-
-    /// Sends a reply to this Query asynchronously.
-    #[inline(always)]
-    pub async fn reply_async(&'_ self, msg: Sample) {
-        self.replies_sender.send_async(msg).await;
+    fn _accepts_any_replies(&self) -> ZResult<bool> {
+        self.parameters()
+            .get_bools([crate::query::_REPLY_KEY_EXPR_ANY_SEL_PARAM])
+            .map(|a| a[0])
     }
 }
 
 impl fmt::Debug for Query {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "Query{{ key_selector: '{}', value_selector: '{}' }}",
-            self.key_selector, self.value_selector
-        )
+        f.debug_struct("Query")
+            .field("key_selector", &self.inner.key_expr)
+            .field("parameters", &self.inner.parameters)
+            .finish()
     }
 }
 
 impl fmt::Display for Query {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "Query{{ '{}{}' }}",
-            self.key_selector, self.value_selector
-        )
+        f.debug_struct("Query")
+            .field(
+                "selector",
+                &format!("{}{}", &self.inner.key_expr, &self.inner.parameters),
+            )
+            .finish()
+    }
+}
+
+/// A builder returned by [`Query::reply()`](Query::reply).
+#[must_use = "Resolvables do nothing unless you resolve them using the `res` method from either `SyncResolve` or `AsyncResolve`"]
+pub struct ReplyBuilder<'a> {
+    query: &'a Query,
+    result: Result<Sample, Value>,
+}
+
+impl<'a> Resolvable for ReplyBuilder<'a> {
+    type To = ZResult<()>;
+}
+
+impl SyncResolve for ReplyBuilder<'_> {
+    fn res_sync(self) -> <Self as Resolvable>::To {
+        match self.result {
+            Ok(sample) => {
+                if !self.query._accepts_any_replies().unwrap_or(false)
+                    && !self.query.key_expr().intersects(&sample.key_expr)
+                {
+                    bail!("Attempted to reply on `{}`, which does not intersect with query `{}`, despite query only allowing replies on matching key expressions", sample.key_expr, self.query.key_expr())
+                }
+                let (key_expr, payload, data_info) = sample.split();
+                self.query.inner.primitives.send_reply_data(
+                    self.query.inner.qid,
+                    self.query.inner.zid,
+                    WireExpr {
+                        scope: 0,
+                        suffix: std::borrow::Cow::Borrowed(key_expr.as_str()),
+                    },
+                    Some(data_info),
+                    payload,
+                );
+                Ok(())
+            }
+            Err(_) => Err(zerror!("Replying errors is not yet supported!").into()),
+        }
+    }
+}
+
+impl<'a> AsyncResolve for ReplyBuilder<'a> {
+    type Future = Ready<Self::To>;
+
+    fn res_async(self) -> Self::Future {
+        std::future::ready(self.res_sync())
     }
 }
 
 pub(crate) struct QueryableState {
     pub(crate) id: Id,
-    pub(crate) key_expr: KeyExpr<'static>,
-    pub(crate) kind: ZInt,
+    pub(crate) key_expr: WireExpr<'static>,
     pub(crate) complete: bool,
-    pub(crate) sender: Sender<Query>,
+    pub(crate) origin: Locality,
+    pub(crate) callback: Arc<dyn Fn(Query) + Send + Sync>,
 }
 
 impl fmt::Debug for QueryableState {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "Queryable{{ id:{}, key_expr:{} }}",
-            self.id, self.key_expr
-        )
+        f.debug_struct("Queryable")
+            .field("id", &self.id)
+            .field("key_expr", &self.key_expr)
+            .field("complete", &self.complete)
+            .finish()
     }
 }
 
-zreceiver! {
-    /// A [`Receiver`] of [`Query`] returned by
-    /// [`Queryable::receiver()`](Queryable::receiver).
-    ///
-    /// `QueryReceiver` implements the `Stream` trait as well as the
-    /// [`Receiver`](crate::prelude::Receiver) trait which allows to access the queries:
-    ///  - synchronously as with a [`std::sync::mpsc::Receiver`](std::sync::mpsc::Receiver)
-    ///  - asynchronously as with a [`async_std::channel::Receiver`](async_std::channel::Receiver).
-    /// `QueryReceiver` also provides a [`recv_async()`](QueryReceiver::recv_async) function which allows
-    /// to access queries asynchronously without needing a mutable reference to the `QueryReceiver`.
-    ///
-    /// `QueryReceiver` implements `Clonable` and it's lifetime is not bound to it's associated
-    /// [`Queryable`]. This is useful to move multiple instances to multiple threads/tasks and perform
-    /// job stealing. When the associated [`QueryReceiver`] is closed or dropped and all queries
-    /// have been received [`Receiver::recv()`](Receiver::recv) will return  `Error` and
-    /// `Receiver::next()` will return `None`.
-    ///
-    /// Examples:
-    /// ```
-    /// # async_std::task::block_on(async {
-    /// use futures::prelude::*;
-    /// use zenoh::prelude::*;
-    /// let session = zenoh::open(config::peer()).await.unwrap();
-    ///
-    /// let mut queryable = session.queryable("/key/expression").wait().unwrap();
-    /// let task1 = async_std::task::spawn({
-    ///     let mut receiver = queryable.receiver().clone();
-    ///     async move {
-    ///         while let Some(query) = receiver.next().await {
-    ///             println!(">> Task1 handling query '{}'", query.selector());
-    ///         }
-    ///     }
-    /// });
-    /// let task2 = async_std::task::spawn({
-    ///     let mut receiver = queryable.receiver().clone();
-    ///     async move {
-    ///         while let Some(query) = receiver.next().await {
-    ///             println!(">> Task2 handling query '{}'", query.selector());
-    ///         }
-    ///     }
-    /// });
-    ///
-    /// async_std::task::sleep(std::time::Duration::from_secs(1)).await;
-    /// queryable.close().await.unwrap();
-    /// futures::join!(task1, task2);
-    /// # })
-    #[derive(Clone)]
-    pub struct QueryReceiver : Receiver<Query> {}
+/// An entity able to reply to queries through a callback.
+///
+/// CallbackQueryables can be created from a zenoh [`Session`](crate::Session)
+/// with the [`declare_queryable`](crate::Session::declare_queryable) function
+/// and the [`callback`](QueryableBuilder::callback) function
+/// of the resulting builder.
+///
+/// Queryables are automatically undeclared when dropped.
+///
+/// # Examples
+/// ```no_run
+/// # async_std::task::block_on(async {
+/// use futures::prelude::*;
+/// use zenoh::prelude::r#async::*;
+///
+/// let session = zenoh::open(config::peer()).res().await.unwrap();
+/// let queryable = session.declare_queryable("key/expression").res().await.unwrap();
+/// while let Ok(query) = queryable.recv_async().await {
+///     println!(">> Handling query '{}'", query.selector());
+///     query.reply(Ok(Sample::try_from("key/expression", "value").unwrap()))
+///         .res()
+///         .await
+///         .unwrap();
+/// }
+/// # })
+/// ```
+#[derive(Debug)]
+pub(crate) struct CallbackQueryable<'a> {
+    pub(crate) session: SessionRef<'a>,
+    pub(crate) state: Arc<QueryableState>,
+    pub(crate) alive: bool,
 }
 
-zreceiver! {
-    /// An entity able to reply to queries.
-    ///
-    /// `Queryable` implements the `Stream` trait as well as the
-    /// [`Receiver`](crate::prelude::Receiver) trait which allows to access the queries:
-    ///  - synchronously as with a [`std::sync::mpsc::Receiver`](std::sync::mpsc::Receiver)
-    ///  - asynchronously as with a [`async_std::channel::Receiver`](async_std::channel::Receiver).
-    /// `Queryable` also provides a [`recv_async()`](Queryable::recv_async) function which allows
-    /// to access queries asynchronously without needing a mutable reference to the `Queryable`.
-    ///
-    /// Queryables are automatically undeclared when dropped.
-    ///
-    /// # Examples
-    ///
-    /// ### sync
-    /// ```no_run
-    /// # use zenoh::prelude::*;
-    /// # let session = zenoh::open(config::peer()).wait().unwrap();
-    ///
-    /// let mut queryable = session.queryable("/key/expression").wait().unwrap();
-    /// while let Ok(query) = queryable.recv() {
-    ///      println!(">> Handling query '{}'", query.selector());
-    /// }
-    /// ```
-    ///
-    /// ### async
-    /// ```no_run
-    /// # async_std::task::block_on(async {
-    /// # use futures::prelude::*;
-    /// # use zenoh::prelude::*;
-    /// # let session = zenoh::open(config::peer()).await.unwrap();
-    ///
-    /// let mut queryable = session.queryable("/key/expression").await.unwrap();
-    /// while let Some(query) = queryable.next().await {
-    ///      println!(">> Handling query '{}'", query.selector());
-    /// }
-    /// # })
-    /// ```
-    pub struct Queryable<'a> : Receiver<Query> {
-        pub(crate) session: SessionRef<'a>,
-        pub(crate) state: Arc<QueryableState>,
-        pub(crate) alive: bool,
-        pub(crate) query_receiver: QueryReceiver,
+impl<'a> Undeclarable<(), QueryableUndeclaration<'a>> for CallbackQueryable<'a> {
+    fn undeclare_inner(self, _: ()) -> QueryableUndeclaration<'a> {
+        QueryableUndeclaration { queryable: self }
     }
 }
 
-impl Queryable<'_> {
-    /// Returns a `Clonable` [`QueryReceiver`] which lifetime is not bound to
-    /// the associated `Queryable` lifetime.
-    pub fn receiver(&mut self) -> &mut QueryReceiver {
-        &mut self.query_receiver
-    }
+/// A [`Resolvable`] returned when undeclaring a queryable.
+///
+/// # Examples
+/// ```
+/// # async_std::task::block_on(async {
+/// use zenoh::prelude::r#async::*;
+///
+/// let session = zenoh::open(config::peer()).res().await.unwrap();
+/// let queryable = session.declare_queryable("key/expression").res().await.unwrap();
+/// queryable.undeclare().res().await.unwrap();
+/// # })
+/// ```
+pub struct QueryableUndeclaration<'a> {
+    queryable: CallbackQueryable<'a>,
+}
 
-    /// Close a [`Queryable`](Queryable) previously created with [`queryable`](Session::queryable).
-    ///
-    /// Queryables are automatically closed when dropped, but you may want to use this function to handle errors or
-    /// close the Queryable asynchronously.
-    ///
-    /// # Examples
-    /// ```
-    /// # async_std::task::block_on(async {
-    /// use zenoh::prelude::*;
-    ///
-    /// let session = zenoh::open(config::peer()).await.unwrap();
-    /// let queryable = session.queryable("/key/expression").await.unwrap();
-    /// queryable.close().await.unwrap();
-    /// # })
-    /// ```
-    #[inline]
-    #[must_use = "ZFutures do nothing unless you `.wait()`, `.await` or poll them"]
-    pub fn close(mut self) -> impl ZFuture<Output = crate::Result<()>> {
-        self.alive = false;
-        self.session.close_queryable(self.state.id)
+impl Resolvable for QueryableUndeclaration<'_> {
+    type To = ZResult<()>;
+}
+
+impl SyncResolve for QueryableUndeclaration<'_> {
+    fn res_sync(mut self) -> <Self as Resolvable>::To {
+        self.queryable.alive = false;
+        self.queryable
+            .session
+            .close_queryable(self.queryable.state.id)
     }
 }
 
-impl Drop for Queryable<'_> {
+impl<'a> AsyncResolve for QueryableUndeclaration<'a> {
+    type Future = Ready<Self::To>;
+
+    fn res_async(self) -> Self::Future {
+        std::future::ready(self.res_sync())
+    }
+}
+
+impl Drop for CallbackQueryable<'_> {
     fn drop(&mut self) {
         if self.alive {
-            let _ = self.session.close_queryable(self.state.id).wait();
+            let _ = self.session.close_queryable(self.state.id);
         }
     }
 }
 
-impl fmt::Debug for Queryable<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        self.state.fmt(f)
-    }
+/// A builder for initializing a [`Queryable`].
+///
+/// # Examples
+/// ```
+/// # async_std::task::block_on(async {
+/// use zenoh::prelude::r#async::*;
+/// use zenoh::queryable;
+///
+/// let session = zenoh::open(config::peer()).res().await.unwrap();
+/// let queryable = session.declare_queryable("key/expression").res().await.unwrap();
+/// # })
+/// ```
+#[derive(Debug)]
+#[must_use = "Resolvables do nothing unless you resolve them using the `res` method from either `SyncResolve` or `AsyncResolve`"]
+pub struct QueryableBuilder<'a, 'b, Handler> {
+    pub(crate) session: SessionRef<'a>,
+    pub(crate) key_expr: ZResult<KeyExpr<'b>>,
+    pub(crate) complete: bool,
+    pub(crate) origin: Locality,
+    pub(crate) handler: Handler,
 }
 
-/// Struct used by a [`Queryable`](Queryable) to send replies to queries.
-#[derive(Clone)]
-pub struct RepliesSender {
-    pub(crate) kind: ZInt,
-    pub(crate) sender: Sender<(ZInt, Sample)>,
-}
-
-impl RepliesSender {
-    #[inline(always)]
-    /// Send a reply.
-    pub fn send(&'_ self, msg: Sample) {
-        if let Err(e) = self.sender.send((self.kind, msg)) {
-            log::error!("Error sending reply: {}", e);
-        }
-    }
-
-    /// Attempt to send a reply. If the channel is full, an error is returned.
-    #[inline(always)]
-    pub fn try_send(&self, msg: Sample) -> core::result::Result<(), TrySendError<Sample>> {
-        match self.sender.try_send((self.kind, msg)) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(sample)) => Err(TrySendError::Full(sample.1)),
-            Err(TrySendError::Disconnected(sample)) => Err(TrySendError::Disconnected(sample.1)),
-        }
-    }
-
-    #[inline(always)]
-    /// Returns the channel capacity of this `RepliesSender`.
-    pub fn capacity(&self) -> usize {
-        self.sender.capacity().unwrap_or(0)
-    }
-
-    #[inline(always)]
-    /// Returns true the channel of this `RepliesSender` is empty.
-    pub fn is_empty(&self) -> bool {
-        self.sender.is_empty()
-    }
-
-    #[inline(always)]
-    /// Returns true the channel of this `RepliesSender` is full.
-    pub fn is_full(&self) -> bool {
-        self.sender.is_full()
-    }
-
-    #[inline(always)]
-    /// Returns the number of replies in the channel of this `RepliesSender`.
-    pub fn len(&self) -> usize {
-        self.sender.len()
-    }
-
-    #[inline(always)]
-    /// Asynchronously send a reply. If the channel is full, the returned future
-    /// will yield to the async runtime.
-    pub async fn send_async(&self, msg: Sample) {
-        if let Err(e) = self.sender.send_async((self.kind, msg)).await {
-            log::error!("Error sending reply: {}", e);
-        }
-    }
-
-    // @TODO
-    // #[inline(always)]
-    // pub fn sink(&self) -> flume::r#async::SendSink<'_, Sample> {
-    //     self.sender.sink()
-    // }
-}
-
-derive_zfuture! {
-    /// A builder for initializing a [`Queryable`](Queryable).
-    ///
-    /// The result of this builder can be accessed synchronously via [`wait()`](ZFuture::wait())
-    /// or asynchronously via `.await`.
+impl<'a, 'b> QueryableBuilder<'a, 'b, DefaultHandler> {
+    /// Receive the queries for this Queryable with a callback.
     ///
     /// # Examples
     /// ```
     /// # async_std::task::block_on(async {
-    /// use futures::prelude::*;
-    /// use zenoh::prelude::*;
-    /// use zenoh::queryable;
+    /// use zenoh::prelude::r#async::*;
     ///
-    /// let session = zenoh::open(config::peer()).await.unwrap();
-    /// let mut queryable = session
-    ///     .queryable("/key/expression")
-    ///     .kind(queryable::EVAL)
+    /// let session = zenoh::open(config::peer()).res().await.unwrap();
+    /// let queryable = session
+    ///     .declare_queryable("key/expression")
+    ///     .callback(|query| {println!(">> Handling query '{}'", query.selector());})
+    ///     .res()
     ///     .await
     ///     .unwrap();
     /// # })
     /// ```
-    #[derive(Debug, Clone)]
-    pub struct QueryableBuilder<'a, 'b> {
-        pub(crate) session: SessionRef<'a>,
-        pub(crate) key_expr: KeyExpr<'b>,
-        pub(crate) kind: ZInt,
-        pub(crate) complete: bool,
-    }
-}
-
-impl<'a, 'b> QueryableBuilder<'a, 'b> {
-    /// Change the queryable kind.
     #[inline]
-    pub fn kind(mut self, kind: ZInt) -> Self {
-        self.kind = kind;
+    pub fn callback<Callback>(self, callback: Callback) -> QueryableBuilder<'a, 'b, Callback>
+    where
+        Callback: Fn(Query) + Send + Sync + 'static,
+    {
+        let QueryableBuilder {
+            session,
+            key_expr,
+            complete,
+            origin,
+            handler: _,
+        } = self;
+        QueryableBuilder {
+            session,
+            key_expr,
+            complete,
+            origin,
+            handler: callback,
+        }
+    }
+
+    /// Receive the queries for this Queryable with a mutable callback.
+    ///
+    /// Using this guarantees that your callback will never be called concurrently.
+    /// If your callback is also accepted by the [`callback`](QueryableBuilder::callback) method, we suggest you use it instead of `callback_mut`
+    ///
+    /// # Examples
+    /// ```
+    /// # async_std::task::block_on(async {
+    /// use zenoh::prelude::r#async::*;
+    ///
+    /// let session = zenoh::open(config::peer()).res().await.unwrap();
+    /// let mut n = 0;
+    /// let queryable = session
+    ///     .declare_queryable("key/expression")
+    ///     .callback_mut(move |query| {n += 1;})
+    ///     .res()
+    ///     .await
+    ///     .unwrap();
+    /// # })
+    /// ```
+    #[inline]
+    pub fn callback_mut<CallbackMut>(
+        self,
+        callback: CallbackMut,
+    ) -> QueryableBuilder<'a, 'b, impl Fn(Query) + Send + Sync + 'static>
+    where
+        CallbackMut: FnMut(Query) + Send + Sync + 'static,
+    {
+        self.callback(locked(callback))
+    }
+
+    /// Receive the queries for this Queryable with a [`Handler`](crate::prelude::IntoCallbackReceiverPair).
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # async_std::task::block_on(async {
+    /// use zenoh::prelude::r#async::*;
+    ///
+    /// let session = zenoh::open(config::peer()).res().await.unwrap();
+    /// let queryable = session
+    ///     .declare_queryable("key/expression")
+    ///     .with(flume::bounded(32))
+    ///     .res()
+    ///     .await
+    ///     .unwrap();
+    /// while let Ok(query) = queryable.recv_async().await {
+    ///     println!(">> Handling query '{}'", query.selector());
+    /// }
+    /// # })
+    /// ```
+    #[inline]
+    pub fn with<Handler>(self, handler: Handler) -> QueryableBuilder<'a, 'b, Handler>
+    where
+        Handler: crate::prelude::IntoCallbackReceiverPair<'static, Query>,
+    {
+        let QueryableBuilder {
+            session,
+            key_expr,
+            complete,
+            origin,
+            handler: _,
+        } = self;
+        QueryableBuilder {
+            session,
+            key_expr,
+            complete,
+            origin,
+            handler,
+        }
+    }
+
+    /// Restrict the matching queries that will be receive by this [`Queryable`]
+    /// to the ones that have the given [`Locality`](crate::prelude::Locality).
+    #[inline]
+    #[zenoh_macros::unstable]
+    pub fn allowed_origin(mut self, origin: Locality) -> Self {
+        self.origin = origin;
         self
     }
-
+}
+impl<'a, 'b, Handler> QueryableBuilder<'a, 'b, Handler> {
     /// Change queryable completeness.
     #[inline]
     pub fn complete(mut self, complete: bool) -> Self {
@@ -377,66 +432,106 @@ impl<'a, 'b> QueryableBuilder<'a, 'b> {
     }
 }
 
-impl<'a> Runnable for QueryableBuilder<'a, '_> {
-    type Output = crate::Result<Queryable<'a>>;
+/// A queryable that provides data through a [`Handler`](crate::prelude::IntoCallbackReceiverPair).
+///
+/// Queryables can be created from a zenoh [`Session`](crate::Session)
+/// with the [`declare_queryable`](crate::Session::declare_queryable) function
+/// and the [`with`](QueryableBuilder::with) function
+/// of the resulting builder.
+///
+/// Queryables are automatically undeclared when dropped.
+///
+/// # Examples
+/// ```no_run
+/// # async_std::task::block_on(async {
+/// use zenoh::prelude::r#async::*;
+///
+/// let session = zenoh::open(config::peer()).res().await.unwrap();
+/// let queryable = session
+///     .declare_queryable("key/expression")
+///     .with(flume::bounded(32))
+///     .res()
+///     .await
+///     .unwrap();
+/// while let Ok(query) = queryable.recv_async().await {
+///     println!(">> Handling query '{}'", query.selector());
+///     query.reply(Ok(Sample::try_from("key/expression", "value").unwrap()))
+///         .res()
+///         .await
+///         .unwrap();
+/// }
+/// # })
+/// ```
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct Queryable<'a, Receiver> {
+    pub(crate) queryable: CallbackQueryable<'a>,
+    pub receiver: Receiver,
+}
 
-    fn run(&mut self) -> Self::Output {
-        log::trace!("queryable({:?}, {:?})", self.key_expr, self.kind);
-        let mut state = zwrite!(self.session.state);
-        let id = state.decl_id_counter.fetch_add(1, Ordering::SeqCst);
-        let (sender, receiver) = bounded(*API_QUERY_RECEPTION_CHANNEL_SIZE);
-        let qable_state = Arc::new(QueryableState {
-            id,
-            key_expr: self.key_expr.to_owned(),
-            kind: self.kind,
-            complete: self.complete,
-            sender,
-        });
-        #[cfg(feature = "complete_n")]
-        {
-            state.queryables.insert(id, qable_state.clone());
+impl<'a, Receiver> Queryable<'a, Receiver> {
+    #[inline]
+    pub fn undeclare(self) -> impl Resolve<ZResult<()>> + 'a {
+        Undeclarable::undeclare_inner(self, ())
+    }
+}
 
-            if self.complete {
-                let primitives = state.primitives.as_ref().unwrap().clone();
-                let complete = Session::complete_twin_qabls(&state, &self.key_expr, self.kind);
-                drop(state);
-                let qabl_info = QueryableInfo {
-                    complete,
-                    distance: 0,
-                };
-                primitives.decl_queryable(&self.key_expr, self.kind, &qabl_info, None);
-            }
-        }
-        #[cfg(not(feature = "complete_n"))]
-        {
-            let twin_qabl = Session::twin_qabl(&state, &self.key_expr, self.kind);
-            let complete_twin_qabl =
-                twin_qabl && Session::complete_twin_qabl(&state, &self.key_expr, self.kind);
+impl<'a, T> Undeclarable<(), QueryableUndeclaration<'a>> for Queryable<'a, T> {
+    fn undeclare_inner(self, _: ()) -> QueryableUndeclaration<'a> {
+        Undeclarable::undeclare_inner(self.queryable, ())
+    }
+}
 
-            state.queryables.insert(id, qable_state.clone());
+impl<Receiver> Deref for Queryable<'_, Receiver> {
+    type Target = Receiver;
 
-            if !twin_qabl || (!complete_twin_qabl && self.complete) {
-                let primitives = state.primitives.as_ref().unwrap().clone();
-                let complete = if !complete_twin_qabl && self.complete {
-                    1
-                } else {
-                    0
-                };
-                drop(state);
-                let qabl_info = QueryableInfo {
-                    complete,
-                    distance: 0,
-                };
-                primitives.decl_queryable(&self.key_expr, self.kind, &qabl_info, None);
-            }
-        }
+    fn deref(&self) -> &Self::Target {
+        &self.receiver
+    }
+}
 
-        Ok(Queryable::new(
-            self.session.clone(),
-            qable_state,
-            true,
-            QueryReceiver::new(receiver.clone()),
-            receiver,
-        ))
+impl<'a, Handler> Resolvable for QueryableBuilder<'a, '_, Handler>
+where
+    Handler: IntoCallbackReceiverPair<'static, Query> + Send,
+    Handler::Receiver: Send,
+{
+    type To = ZResult<Queryable<'a, Handler::Receiver>>;
+}
+
+impl<'a, Handler> SyncResolve for QueryableBuilder<'a, '_, Handler>
+where
+    Handler: IntoCallbackReceiverPair<'static, Query> + Send,
+    Handler::Receiver: Send,
+{
+    fn res_sync(self) -> <Self as Resolvable>::To {
+        let session = self.session;
+        let (callback, receiver) = self.handler.into_cb_receiver_pair();
+        session
+            .declare_queryable_inner(
+                &self.key_expr?.to_wire(&session),
+                self.complete,
+                self.origin,
+                callback,
+            )
+            .map(|qable_state| Queryable {
+                queryable: CallbackQueryable {
+                    session,
+                    state: qable_state,
+                    alive: true,
+                },
+                receiver,
+            })
+    }
+}
+
+impl<'a, Handler> AsyncResolve for QueryableBuilder<'a, '_, Handler>
+where
+    Handler: IntoCallbackReceiverPair<'static, Query> + Send,
+    Handler::Receiver: Send,
+{
+    type Future = Ready<Self::To>;
+
+    fn res_async(self) -> Self::Future {
+        std::future::ready(self.res_sync())
     }
 }

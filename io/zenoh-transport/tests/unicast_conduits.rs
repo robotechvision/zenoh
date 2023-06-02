@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -14,16 +14,19 @@
 use async_std::prelude::FutureExt;
 use async_std::task;
 use std::any::Any;
-use std::fmt::Write;
+use std::convert::TryFrom;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use zenoh_buffers::ZBuf;
 use zenoh_core::zasync_executor_init;
-use zenoh_core::Result as ZResult;
-use zenoh_link::{EndPoint, Link};
-use zenoh_protocol::proto::ZenohMessage;
-use zenoh_protocol_core::{Channel, CongestionControl, PeerId, Priority, Reliability, WhatAmI};
+use zenoh_link::Link;
+use zenoh_protocol::{
+    core::{Channel, CongestionControl, EndPoint, Priority, Reliability, WhatAmI, ZenohId},
+    zenoh::ZenohMessage,
+};
+use zenoh_result::ZResult;
 use zenoh_transport::{
     TransportEventHandler, TransportManager, TransportMulticast, TransportMulticastEventHandler,
     TransportPeer, TransportPeerEventHandler, TransportUnicast,
@@ -179,34 +182,34 @@ async fn open_transport(
     TransportUnicast,
 ) {
     // Define client and router IDs
-    let client_id = PeerId::new(1, [0_u8; PeerId::MAX_SIZE]);
-    let router_id = PeerId::new(1, [1_u8; PeerId::MAX_SIZE]);
+    let client_id = ZenohId::try_from([1]).unwrap();
+    let router_id = ZenohId::try_from([2]).unwrap();
 
     // Create the router transport manager
     let router_handler = Arc::new(SHRouter::new(priority));
     let router_manager = TransportManager::builder()
         .whatami(WhatAmI::Router)
-        .pid(router_id)
+        .zid(router_id)
         .build(router_handler.clone())
         .unwrap();
 
     // Create the client transport manager
     let client_manager = TransportManager::builder()
         .whatami(WhatAmI::Client)
-        .pid(client_id)
+        .zid(client_id)
         .build(Arc::new(SHClient::default()))
         .unwrap();
 
     // Create the listener on the router
     for e in endpoints.iter() {
-        println!("Add locator: {}", e);
+        println!("Add locator: {e}");
         let _ = ztimeout!(router_manager.add_listener(e.clone())).unwrap();
     }
 
     // Create an empty transport with the client
     // Open transport -> This should be accepted
     for e in endpoints.iter() {
-        println!("Opening transport with {}", e);
+        println!("Opening transport with {e}");
         let _ = ztimeout!(client_manager.open_transport(e.clone())).unwrap();
     }
 
@@ -230,9 +233,9 @@ async fn close_transport(
     // Close the client transport
     let mut ee = String::new();
     for e in endpoints.iter() {
-        write!(ee, "{} ", e).unwrap();
+        let _ = write!(ee, "{e} ");
     }
-    println!("Closing transport with {}", ee);
+    println!("Closing transport with {ee}");
     ztimeout!(client_transport.close()).unwrap();
 
     ztimeout!(async {
@@ -243,7 +246,7 @@ async fn close_transport(
 
     // Stop the locators on the manager
     for e in endpoints.iter() {
-        println!("Del locator: {}", e);
+        println!("Del locator: {e}");
         ztimeout!(router_manager.del_listener(e)).unwrap();
     }
 
@@ -264,7 +267,7 @@ async fn single_run(
     msg_size: usize,
 ) {
     // Create the message to send
-    let key = "/test".into();
+    let key = "test".into();
     let payload = ZBuf::from(vec![0_u8; msg_size]);
     let data_info = None;
     let routing_context = None;
@@ -281,10 +284,7 @@ async fn single_run(
         attachment,
     );
 
-    println!(
-        "Sending {} messages... {:?} {}",
-        MSG_COUNT, channel, msg_size
-    );
+    println!("Sending {MSG_COUNT} messages... {channel:?} {msg_size}");
     for _ in 0..MSG_COUNT {
         client_transport.schedule(message.clone()).unwrap();
     }
@@ -314,6 +314,7 @@ async fn run(endpoints: &[EndPoint], channel: &[Channel], msg_size: &[usize]) {
 #[cfg(feature = "transport_tcp")]
 #[test]
 fn conduits_tcp_only() {
+    let _ = env_logger::try_init();
     task::block_on(async {
         zasync_executor_init!();
     });
@@ -325,7 +326,7 @@ fn conduits_tcp_only() {
         });
     }
     // Define the locators
-    let endpoints: Vec<EndPoint> = vec!["tcp/127.0.0.1:13447".parse().unwrap()];
+    let endpoints: Vec<EndPoint> = vec![format!("tcp/127.0.0.1:{}", 10000).parse().unwrap()];
     // Run
     task::block_on(run(&endpoints, &channel, &MSG_SIZE_ALL));
 }
@@ -333,6 +334,7 @@ fn conduits_tcp_only() {
 #[cfg(feature = "transport_ws")]
 #[test]
 fn conduits_ws_only() {
+    let _ = env_logger::try_init();
     task::block_on(async {
         zasync_executor_init!();
     });
@@ -344,7 +346,7 @@ fn conduits_ws_only() {
         });
     }
     // Define the locators
-    let endpoints: Vec<EndPoint> = vec!["ws/127.0.0.1:13448".parse().unwrap()];
+    let endpoints: Vec<EndPoint> = vec![format!("ws/127.0.0.1:{}", 10010).parse().unwrap()];
     // Run
     task::block_on(run(&endpoints, &channel, &MSG_SIZE_ALL));
 }

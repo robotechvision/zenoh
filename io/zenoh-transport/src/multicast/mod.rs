@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2022 ZettaScale Technology
+// Copyright (c) 2023 ZettaScale Technology
 //
 // This program and the accompanying materials are made available under the
 // terms of the Eclipse Public License 2.0 which is available at
@@ -21,17 +21,17 @@ pub(crate) mod tx;
 use super::common;
 #[cfg(feature = "stats")]
 use super::common::stats::stats_struct;
-use super::protocol;
-use super::protocol::core::ZInt;
-use super::protocol::proto::{tmsg, ZenohMessage};
 use crate::{TransportMulticastEventHandler, TransportPeer};
 pub use manager::*;
-use std::fmt;
-use std::sync::{Arc, Weak};
+use std::{
+    fmt,
+    sync::{Arc, Weak},
+};
 use transport::{TransportMulticastConfig, TransportMulticastInner};
-use zenoh_core::Result as ZResult;
-use zenoh_core::{zerror, zread};
+use zenoh_core::zread;
 use zenoh_link::Link;
+use zenoh_protocol::{core::ZInt, transport::tmsg, zenoh::ZenohMessage};
+use zenoh_result::{zerror, ZResult};
 
 /*************************************/
 /*              STATS                */
@@ -172,7 +172,7 @@ impl fmt::Debug for TransportMulticast {
                 let peers: String = zread!(transport.peers)
                     .iter()
                     .map(|(l, p)| {
-                        format!("(locator: {}, pid: {}, whatami: {})", l, p.pid, p.whatami)
+                        format!("(locator: {}, zid: {}, whatami: {})", l, p.zid, p.whatami)
                     })
                     .collect();
 
@@ -184,7 +184,7 @@ impl fmt::Debug for TransportMulticast {
                     .finish()
             }
             Err(e) => {
-                write!(f, "{}", e)
+                write!(f, "{e}")
             }
         }
     }
